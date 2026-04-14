@@ -58,7 +58,7 @@ os.makedirs(TEMP_DIR_DISK, exist_ok=True)
 
 # --- yt-dlp Options ---
 YDL_OPTIONS_RAM = {
-    'format': 'bestaudio[acodec=opus]/bestaudio/best',
+    'format': '251/250/249/bestaudio/best',
     'noplaylist': False, 'quiet': True, 'no_warnings': True,
     'default_search': 'ytsearch', 'source_address': '0.0.0.0',
     'outtmpl': f'{TEMP_DIR_RAM}/%(id)s.%(ext)s',
@@ -68,7 +68,7 @@ YDL_OPTIONS_RAM = {
 }
 
 YDL_OPTIONS_DISK = {
-    'format': 'bestaudio[acodec=opus]/bestaudio/best',
+    'format': '251/250/249/bestaudio/best',
     'noplaylist': False, 'quiet': True, 'no_warnings': True,
     'default_search': 'ytsearch', 'source_address': '0.0.0.0',
     'outtmpl': f'{TEMP_DIR_DISK}/%(id)s.%(ext)s',
