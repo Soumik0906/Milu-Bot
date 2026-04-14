@@ -64,7 +64,7 @@ YDL_OPTIONS_RAM = {
     'outtmpl': f'{TEMP_DIR_RAM}/%(id)s.%(ext)s',
     'http_headers': {'User-Agent': 'Mozilla/5.0'},
     'cookiefile': 'cookies.txt',
-    'extractor_args': {'youtube': {'player_client': ['web']}},
+    'extractor_args': {'youtube': {'player_client': ['android', 'web']}},
 }
 
 YDL_OPTIONS_DISK = {
@@ -74,7 +74,7 @@ YDL_OPTIONS_DISK = {
     'outtmpl': f'{TEMP_DIR_DISK}/%(id)s.%(ext)s',
     'http_headers': {'User-Agent': 'Mozilla/5.0'},
     'cookiefile': 'cookies.txt',
-    'extractor_args': {'youtube': {'player_client': ['web']}},
+    'extractor_args': {'youtube': {'player_client': ['android', 'web']}},
 }
 
 # --- FFmpeg Options (Optimized for Local Files) ---
@@ -107,7 +107,7 @@ def fetch_audio(query):
         'quiet': True,
         'cookiefile': 'cookies.txt', 
         'default_search': 'ytsearch',
-        'extractor_args': {'youtube': {'player_client': ['web']}}
+        'extractor_args': {'youtube': {'player_client': ['android', 'web']}},
     }
     
     with yt_dlp.YoutubeDL(probe_opts) as ydl:
