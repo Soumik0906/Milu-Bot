@@ -11,7 +11,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the bot code
+# Copy the bot code and cookie file
+COPY cookies.txt .
 COPY bot.py .
 
 # Hugging Face Spaces expects traffic on port 7860

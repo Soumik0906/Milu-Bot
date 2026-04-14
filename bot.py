@@ -17,6 +17,25 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+import os
+
+# --- Cookie Diagnostics ---
+cookie_path = 'cookies.txt'
+if os.path.exists(cookie_path):
+    size = os.path.getsize(cookie_path)
+    print(f"✅ Cookie file found! Size: {size} bytes.")
+    with open(cookie_path, 'r') as f:
+        first_line = f.readline().strip()
+        if first_line == "# Netscape HTTP Cookie File":
+            print("✅ Cookie file format looks correct (Netscape).")
+        else:
+            print(f"❌ Cookie file format looks WRONG! First line is: '{first_line}'")
+            print("❌ It MUST start with '# Netscape HTTP Cookie File'")
+else:
+    print("❌ CRITICAL ERROR: cookies.txt NOT FOUND in the directory!")
+    print(f"Current directory contents: {os.listdir('.')}")
+
+
 # --- Real-Time Audio Priority ---
 gc.disable()
 
@@ -44,6 +63,8 @@ YDL_OPTIONS_RAM = {
     'default_search': 'ytsearch', 'source_address': '0.0.0.0',
     'outtmpl': f'{TEMP_DIR_RAM}/%(id)s.%(ext)s',
     'http_headers': {'User-Agent': 'Mozilla/5.0'},
+    'cookiefile': 'cookies.txt',
+    'extractor_args': {'youtube': {'player_client': ['web']}},
 }
 
 YDL_OPTIONS_DISK = {
@@ -52,6 +73,8 @@ YDL_OPTIONS_DISK = {
     'default_search': 'ytsearch', 'source_address': '0.0.0.0',
     'outtmpl': f'{TEMP_DIR_DISK}/%(id)s.%(ext)s',
     'http_headers': {'User-Agent': 'Mozilla/5.0'},
+    'cookiefile': 'cookies.txt',
+    'extractor_args': {'youtube': {'player_client': ['web']}},
 }
 
 # --- FFmpeg Options (Optimized for Local Files) ---
@@ -78,10 +101,16 @@ def get_queue(guild_id):
         queues[guild_id] = deque()
     return queues[guild_id]
 
-# --- Fetch Audio (Hybrid) ---
 def fetch_audio(query):
     # 1. Quick probe to check duration (no downloading yet)
-    with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
+    probe_opts = {
+        'quiet': True,
+        'cookiefile': 'cookies.txt', 
+        'default_search': 'ytsearch',
+        'extractor_args': {'youtube': {'player_client': ['web']}}
+    }
+    
+    with yt_dlp.YoutubeDL(probe_opts) as ydl:
         if not query.startswith("http"):
             query = f"ytsearch:{query}"
         info = ydl.extract_info(query, download=False)
