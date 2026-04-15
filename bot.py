@@ -336,6 +336,22 @@ async def on_command_error(ctx, error):
         traceback.print_exc()
 
 
+# --- Auto cleanup on disconnect ---
+@bot.event
+async def on_voice_state_update(member, before, after):
+    """Clean up if bot gets disconnected unexpectedly."""
+    if member == bot.user:
+        if before.channel and not after.channel:
+            # Bot was disconnected
+            guild_id = before.channel.guild.id
+            queue = get_queue(guild_id)
+            for song in queue:
+                cleanup_song(song)
+            queue.clear()
+            # now_playing.pop(guild_id, None)
+            # loop_modes.pop(guild_id, None)
+            print(f"Bot disconnected from guild {guild_id}, cleaned up.")
+
 load_dotenv()
 
 # --- Dummy Web Server for Hugging Face ---
