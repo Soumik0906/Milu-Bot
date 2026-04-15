@@ -254,8 +254,6 @@ async def play_next(ctx):
     loop_mode = get_loop_mode(ctx.guild.id)
 
     if not queue:
-        if loop_mode != 'off':
-            pass  # loop_mode stays; queue refill handled below if needed
         if ctx.voice_client:
             await ctx.send("✅ Queue is empty. Leaving voice channel.")
             await ctx.voice_client.disconnect()
@@ -264,23 +262,12 @@ async def play_next(ctx):
     if not ctx.voice_client:
         return
 
+    # Always just peek/pop the song — loop re-adding happens AFTER playback
     song = queue.popleft()
-
-    # --- LOOP LOGIC ---
-    if loop_mode == 'single':
-        # Re-add the same song to the front so it repeats
-        # We do NOT cleanup the file since we'll play it again
-        queue.appendleft(song)
-    elif loop_mode == 'queue':
-        # Re-add to the end of the queue
-        queue.append(song)
-    # else: 'off' — normal behavior, song consumed
 
     if not os.path.exists(song.get('filepath', '')):
         await ctx.send(f"❌ File missing for **{song['title']}**, skipping.")
         cleanup_song(song)
-        if loop_mode == 'single':
-            queue.popleft()  # remove the bad re-added entry
         await play_next(ctx)
         return
 
@@ -296,19 +283,30 @@ async def play_next(ctx):
         await play_next(ctx)
         return
 
-    # Only cleanup in 'off' mode; loop modes reuse the file
-    should_cleanup = loop_mode == 'off'
-
     def after_play(error):
-        if should_cleanup:
+        # ✅ Read loop mode HERE, at the moment playback ends
+        current_loop_mode = get_loop_mode(ctx.guild.id)
+
+        if current_loop_mode == 'single':
+            # Re-insert at front, do NOT clean up the file
+            queue.appendleft(song)
+        elif current_loop_mode == 'queue':
+            # Re-insert at end, do NOT clean up the file
+            queue.append(song)
+        else:
+            # 'off' — normal behavior, clean up
             cleanup_song(song)
+
         if error:
             print(f"Playback error: {error}")
+
         asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)
 
     now_playing[ctx.guild.id] = song
     ctx.voice_client.play(source, after=after_play)
 
+    # Read loop mode now just for the display message
+    loop_mode = get_loop_mode(ctx.guild.id)
     storage_emoji = "💾" if song['storage_type'] == 'disk' else "⚡"
     loop_emoji = {"off": "", "single": " 🔂", "queue": " 🔁"}
     await ctx.send(
