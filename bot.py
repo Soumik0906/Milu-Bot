@@ -227,6 +227,19 @@ async def play_next(ctx):
     storage_emoji = "💾" if song['storage_type'] == 'disk' else "⚡"
     await ctx.send(f"🎵 Now playing: **{song['title']}** {storage_emoji}")
 
+
+async def fetch_with_timeout(ctx, query, timeout=120):
+    """Wraps fetch_audio with a timeout."""
+    try:
+        song = await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(executor, fetch_audio, query),
+            timeout=timeout
+        )
+        return song
+    except asyncio.TimeoutError:
+        return await ctx.send(f"❌ Download timed out for: `{query}`")
+
+
 # --- Commands ---
 
 @bot.command(name="play", aliases=["p"])
@@ -239,7 +252,10 @@ async def play(ctx, *, query: str):
 
     await ctx.send(f"🔍 Searching and downloading: `{query}`...")
     try:
-        song = await asyncio.get_event_loop().run_in_executor(executor, fetch_audio, query)
+        result = await fetch_with_timeout(ctx, query)
+        if isinstance(result, discord.Message):
+            return
+        song = result
     except Exception as e:
         return await ctx.send(f"❌ Error fetching audio: {e}")
 
