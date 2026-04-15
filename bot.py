@@ -11,54 +11,17 @@ import tempfile
 import os
 import subprocess
 import shutil
+import time
 import gc
 import ctypes
 
-
-COOKIE_PATH = "cookies.txt"
-
-
-def write_cookies_from_env():
-    """
-    Writes cookies.txt from the COOKIES_TXT environment variable.
-    This allows storing sensitive cookies as a HuggingFace/Docker secret
-    instead of baking them into the image.
-    """
-    cookies_content = os.environ.get("COOKIES_TXT", "").strip()
-
-    if cookies_content:
-        # The secret might have escaped newlines (\n) instead of real newlines
-        # This handles both cases safely
-        cookies_content = cookies_content.replace("\\n", "\n")
-
-        with open(COOKIE_PATH, "w", encoding="utf-8") as f:
-            f.write(cookies_content)
-            # Ensure file ends with a newline
-            if not cookies_content.endswith("\n"):
-                f.write("\n")
-
-        print(
-            f"✅ cookies.txt written from environment secret ({len(cookies_content)} chars)."
-        )
-    else:
-        print("⚠️  COOKIES_TXT secret is empty or not set. Proceeding without cookies.")
-        print("   YouTube may block requests without authentication.")
-
-
-write_cookies_from_env()
-
-
-# ─── Deno Diagnostics ─────────────────────────────────────────────────────────
+# --- Deno Diagnostics ---
 print("--- Deno Diagnostics ---")
-deno_path = shutil.which("deno")
+deno_path = shutil.which('deno')
 if deno_path:
     print(f"✅ Deno found at: {deno_path}")
     try:
-        deno_ver = (
-            subprocess.check_output([deno_path, "--version"], text=True)
-            .strip()
-            .split("\n")[0]
-        )
+        deno_ver = subprocess.check_output([deno_path, '--version'], text=True).strip().split('\n')[0]
         print(f"✅ {deno_ver}")
     except Exception as e:
         print(f"❌ Deno found but failed to execute: {e}")
@@ -66,163 +29,83 @@ else:
     print("❌ Deno NOT FOUND in PATH!")
 print("------------------------")
 
-# ─── Cookie Diagnostics ───────────────────────────────────────────────────────
-if os.path.exists(COOKIE_PATH):
-    size = os.path.getsize(COOKIE_PATH)
-    print(f"✅ Cookie file found! Size: {size} bytes.")
-    with open(COOKIE_PATH, "r") as f:
-        first_line = f.readline().strip()
-    if first_line == "# Netscape HTTP Cookie File":
-        print("✅ Cookie file format looks correct (Netscape).")
-    else:
-        print(f"❌ Cookie file format looks WRONG! First line is: '{first_line}'")
-        print("❌ It MUST start with '# Netscape HTTP Cookie File'")
+load_dotenv()
+
+cookies_content = os.getenv("COOKIES_TXT")
+if cookies_content:
+    with open('cookies.txt', 'w') as f:
+        f.write(cookies_content)
+    print("✅ cookies.txt written from COOKIES_TXT secret.")
 else:
-    print("❌ CRITICAL: cookies.txt NOT FOUND!")
-    print(f"   Directory contents: {os.listdir('.')}")
-
-
-# --- Real-Time Audio Priority ---
-gc.disable()
-
-try:
-    libc = ctypes.CDLL("libc.so.6")
-    libc.mlockall(3)
-except Exception:
-    print("⚠️ Could not lock memory.")
-
+    print("❌ COOKIES_TXT secret not found! YouTube may not work.")
 
 # --- Bot Setup ---
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+# --- Cookie Diagnostics ---
+cookie_path = 'cookies.txt'
+if os.path.exists(cookie_path):
+    size = os.path.getsize(cookie_path)
+    print(f"✅ Cookie file found! Size: {size} bytes.")
+    with open(cookie_path, 'r') as f:
+        first_line = f.readline().strip()
+        if first_line == "# Netscape HTTP Cookie File":
+            print("✅ Cookie file format looks correct (Netscape).")
+        else:
+            print(f"❌ Cookie file format looks WRONG! First line is: '{first_line}'")
+else:
+    print("❌ CRITICAL ERROR: cookies.txt NOT FOUND!")
+    print(f"Current directory contents: {os.listdir('.')}")
+
+# --- Real-Time Audio Priority ---
+gc.disable()
+
+try:
+    libc = ctypes.CDLL('libc.so.6')
+    libc.mlockall(3)
+except Exception:
+    print("⚠️ Could not lock memory.")
 
 # --- Thread Pool ---
 executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
-# --- Storage Directories ---
-TEMP_DIR_RAM = tempfile.mkdtemp(prefix="musicbot_ram_", dir="/dev/shm")
-TEMP_DIR_DISK = "./bot_downloads"
-os.makedirs(TEMP_DIR_DISK, exist_ok=True)
-
-# --- yt-dlp Options (FIXED) ---
-#
-# CHANGES MADE:
-#   1. Removed 'extractor_args' — the multiple player_client values
-#      (tv, android, ios, web) caused yt-dlp to report formats that
-#      aren't actually downloadable, leading to the
-#      "Requested format is not available" error.
-#   2. Changed format from '251/250/249/bestaudio/best' to
-#      'bestaudio/best' — this lets yt-dlp pick the best available
-#      audio format automatically instead of demanding specific
-#      itag numbers that may not exist for every video.
-#   3. Removed 'http_headers' — cookies handle authentication;
-#      a custom User-Agent can actually trigger anti-bot detection.
-#
-YDL_OPTIONS_RAM = {
-    "format": "bestaudio/best",
-    "noplaylist": False,
-    "quiet": True,
-    "no_warnings": True,
-    "default_search": "ytsearch",
-    "source_address": "0.0.0.0",
-    "outtmpl": f"{TEMP_DIR_RAM}/%(id)s.%(ext)s",
-    "cookiefile": "cookies.txt",
-}
-
-YDL_OPTIONS_DISK = {
-    "format": "bestaudio/best",
-    "noplaylist": False,
-    "quiet": True,
-    "no_warnings": True,
-    "default_search": "ytsearch",
-    "source_address": "0.0.0.0",
-    "outtmpl": f"{TEMP_DIR_DISK}/%(id)s.%(ext)s",
-    "cookiefile": "cookies.txt",
-}
-
-# --- FFmpeg Options ---
+# --- FFmpeg Options for Streaming ---
 FFMPEG_OPTIONS = {
-    "before_options": (
-        "-analyzeduration 20000000 "
-        "-probesize 20000000 "
-        "-thread_queue_size 8192 "
-        "-threads 4"
+    'before_options': (
+        '-reconnect 1 '
+        '-reconnect_streamed 1 '
+        '-reconnect_delay_max 5 '
+        '-analyzeduration 20000000 '
+        '-probesize 20000000 '
+        '-thread_queue_size 8192 '
+        '-threads 4'
     ),
-    "options": (
-        "-vn -bufsize 2048k -af aresample=async=1:min_comp=0.01:max_soft_comp=10"
+    'options': (
+        '-vn '
+        '-bufsize 2048k '
+        '-af aresample=async=1:min_comp=0.01:max_soft_comp=10'
     ),
 }
 
 # --- Queue Storage ---
 queues = {}
-loop_modes = {}  # guild_id -> 'off' | 'single' | 'queue'
-volumes = {}  # guild_id -> float (0.0 to 1.0)
+loop_modes = {}   # guild_id -> 'off' | 'single' | 'queue'
+volumes = {}      # guild_id -> float (0.0 to 1.0)
 now_playing = {}
-pending_downloads = {}  # guild_id -> count of active downloads
+pending_downloads = {}  # guild_id -> count of active fetches
+skip_flag = set()       # guilds where skip was requested
 
+
+# --- Helpers ---
 
 def get_loop_mode(guild_id):
-    return loop_modes.get(guild_id, "off")
-
-
-@bot.command(name="loop", aliases=["l"])
-async def loop_cmd(ctx, mode: str = None):
-    """Usage: !loop off / single / queue"""
-    modes = {"off", "single", "queue"}
-    if mode is None:
-        current = get_loop_mode(ctx.guild.id)
-        await ctx.send(f"🔁 Current loop mode: **{current}**")
-        return
-    mode = mode.lower()
-    if mode not in modes:
-        return await ctx.send("❌ Options: `off`, `single`, `queue`")
-    loop_modes[ctx.guild.id] = mode
-    emojis = {"off": "➡️", "single": "🔂", "queue": "🔁"}
-    await ctx.send(f"{emojis[mode]} Loop mode set to: **{mode}**")
+    return loop_modes.get(guild_id, 'off')
 
 
 def get_volume(guild_id):
-    return volumes.get(guild_id, 0.5)  # default volume 50%
-
-
-@bot.command(name="volume", aliases=["vol", "v"])
-async def volume_cmd(ctx, vol: int = None):
-    """Set volume 1-100. No argument to see current."""
-    if vol is None:
-        current = int(get_volume(ctx.guild.id) * 100)
-        return await ctx.send(f"🔊 Current volume: **{current}%**")
-
-    if not 1 <= vol <= 100:
-        return await ctx.send("❌ Volume must be between 1 and 100.")
-
-    volumes[ctx.guild.id] = vol / 100.0
-
-    # Apply to currently playing source
-    if ctx.voice_client and ctx.voice_client.source:
-        ctx.voice_client.source.volume = vol / 100.0
-
-    await ctx.send(f"🔊 Volume set to **{vol}%**")
-
-
-@bot.command(name="nowplaying", aliases=["np"])
-async def now_playing_cmd(ctx):
-    song = now_playing.get(ctx.guild.id)
-    if not song or not ctx.voice_client or not ctx.voice_client.is_playing():
-        return await ctx.send("❌ Nothing is playing right now.")
-
-    duration = song.get("duration", 0)
-    mins, secs = divmod(int(duration), 60)
-    storage = "💾 Disk" if song["storage_type"] == "disk" else "⚡ RAM"
-    loop_mode = get_loop_mode(ctx.guild.id)
-    vol = int(get_volume(ctx.guild.id) * 100)
-
-    await ctx.send(
-        f"🎵 **Now Playing:** {song['title']}\n"
-        f"⏱️ Duration: {mins}:{secs:02d} | {storage}\n"
-        f"🔁 Loop: {loop_mode} | 🔊 Volume: {vol}%"
-    )
+    return volumes.get(guild_id, 0.5)
 
 
 def get_queue(guild_id):
@@ -231,87 +114,118 @@ def get_queue(guild_id):
     return queues[guild_id]
 
 
-def fetch_audio(query):
-    # 1. Quick probe (no downloading yet)
-    #    FIXED: removed extractor_args here too
-    probe_opts = {
-        "quiet": True,
-        "cookiefile": "cookies.txt",
-        "default_search": "ytsearch",
-    }
-
-    with yt_dlp.YoutubeDL(probe_opts) as ydl:
-        if not query.startswith("http"):
-            query = f"ytsearch:{query}"
-        info = ydl.extract_info(query, download=False)
-        if "entries" in info:
-            info = info["entries"][0]
-
-    duration = info.get("duration") or 0
-    title = info.get("title", "Unknown Title")
-
-    # 2. Decide where to download based on length
-    if duration > 3600:
-        ydl_opts = YDL_OPTIONS_DISK
-        storage_type = "disk"
-    else:
-        ydl_opts = YDL_OPTIONS_RAM
-        storage_type = "ram"
-
-    # 3. Download the file
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(query, download=True)
-        if "entries" in info:
-            info = info["entries"][0]
-
-        filepath = info["requested_downloads"][0]["filepath"]
-
-        # Fallback just in case
-        if not os.path.exists(filepath):
-            base = os.path.splitext(filepath)[0]
-            for ext in (".webm", ".opus", ".m4a", ".ogg", ".mp3"):
-                candidate = base + ext
-                if os.path.exists(candidate):
-                    filepath = candidate
-                    break
-
-    return {
-        "filepath": filepath,
-        "title": title,
-        "duration": duration,
-        "storage_type": storage_type,
-    }
-
-
-# --- Cleanup ---
 def cleanup_song(song):
+    """Streaming songs have no file. Kept for compatibility."""
     if not song:
         return
     try:
-        filepath = song.get("filepath")
+        filepath = song.get('filepath')
         if filepath and os.path.exists(filepath):
             os.remove(filepath)
     except Exception:
         pass
 
 
-# --- Play Next ---
+# --- Audio Fetching (Stream, No Download) ---
+
+def fetch_audio(query):
+    """
+    Extracts a direct stream URL from YouTube (or any yt-dlp source).
+    Does NOT download the file — FFmpeg streams it directly.
+    """
+    ydl_opts = {
+        'format': 'bestaudio/best',
+        'quiet': True,
+        'no_warnings': True,
+        'cookiefile': 'cookies.txt',
+        'default_search': 'ytsearch',
+        'noplaylist': False,
+    }
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        if not query.startswith("http"):
+            query = f"ytsearch:{query}"
+        info = ydl.extract_info(query, download=False)
+        if 'entries' in info:
+            info = info['entries'][0]
+
+    duration = info.get('duration') or 0
+    title = info.get('title', 'Unknown Title')
+
+    # Primary: yt-dlp puts the chosen format's URL here
+    stream_url = info.get('url')
+
+    # Fallback: walk formats list
+    if not stream_url:
+        for f in reversed(info.get('formats', [])):
+            if f.get('acodec') != 'none' and f.get('url'):
+                stream_url = f['url']
+                break
+
+    if not stream_url:
+        raise ValueError(f"Could not extract stream URL for: {title}")
+
+    return {
+        'stream_url': stream_url,
+        'http_headers': info.get('http_headers', {}),
+        'title': title,
+        'duration': duration,
+        'storage_type': 'stream',
+        'filepath': None,
+        'webpage_url': info.get('webpage_url', query),
+        'fetched_at': time.time(),
+    }
+
+
+async def fetch_with_timeout(ctx, query, timeout=120):
+    """Wraps fetch_audio with a timeout."""
+    try:
+        song = await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(executor, fetch_audio, query),
+            timeout=timeout
+        )
+        return song
+    except asyncio.TimeoutError:
+        await ctx.send(f"❌ Timed out fetching: `{query}`")
+        return None
+
+
+# --- URL Refresh (for songs sitting in queue > 4 hours) ---
+
+async def maybe_refresh_url(song):
+    """
+    YouTube stream URLs expire in ~6 hours.
+    Re-extract if the song has been in the queue for more than 4 hours.
+    """
+    age = time.time() - song.get('fetched_at', time.time())
+    if age > 4 * 3600:
+        print(f"🔄 Refreshing expired URL for: {song['title']}")
+        try:
+            fresh = await asyncio.get_event_loop().run_in_executor(
+                executor,
+                fetch_audio,
+                song['webpage_url']
+            )
+            song['stream_url'] = fresh['stream_url']
+            song['http_headers'] = fresh['http_headers']
+            song['fetched_at'] = time.time()
+        except Exception as e:
+            print(f"❌ Failed to refresh URL for {song['title']}: {e}")
+    return song
+
+
+# --- Core Playback ---
+
 async def play_next(ctx):
     gc.collect()
     guild_id = ctx.guild.id
     queue = get_queue(guild_id)
-    loop_mode = get_loop_mode(guild_id)
 
     if not queue:
-        # Don't disconnect if there are still songs being downloaded
         if pending_downloads.get(guild_id, 0) > 0:
-            await ctx.send("⏳ Waiting for downloads to finish...")
-
-            # Wait until a song appears in the queue or downloads finish
+            await ctx.send("⏳ Waiting for remaining songs to be fetched...")
             while pending_downloads.get(guild_id, 0) > 0 and not queue:
                 await asyncio.sleep(1)
-
-            # If still empty after all downloads finished, then disconnect
             if not queue:
                 if ctx.voice_client:
                     await ctx.send("✅ Queue is empty. Leaving voice channel.")
@@ -326,22 +240,29 @@ async def play_next(ctx):
     if not ctx.voice_client:
         return
 
-    # Always just peek/pop the song — loop re-adding happens AFTER playback
     song = queue.popleft()
 
-    if not os.path.exists(song.get("filepath", "")):
-        await ctx.send(f"❌ File missing for **{song['title']}**, skipping.")
-        cleanup_song(song)
-        await play_next(ctx)
-        return
+    # Refresh URL if it's been sitting in the queue too long
+    song = await maybe_refresh_url(song)
+
+    # Build FFmpeg before_options with HTTP headers injected
+    http_headers = song.get('http_headers', {})
+    header_str = ''.join(f"{k}: {v}\r\n" for k, v in http_headers.items())
+
+    before_options = FFMPEG_OPTIONS['before_options']
+    if header_str:
+        before_options = f"-headers '{header_str}' " + before_options
+
+    ffmpeg_opts = {
+        'before_options': before_options,
+        'options': FFMPEG_OPTIONS['options'],
+    }
 
     try:
-        source = discord.FFmpegPCMAudio(song["filepath"], **FFMPEG_OPTIONS)
-        vol = get_volume(guild_id)
-        source = discord.PCMVolumeTransformer(source, volume=vol)
+        source = discord.FFmpegPCMAudio(song['stream_url'], **ffmpeg_opts)
+        source = discord.PCMVolumeTransformer(source, volume=get_volume(guild_id))
     except Exception as e:
-        await ctx.send(f"❌ Error playing **{song['title']}**: {e}")
-        cleanup_song(song)
+        await ctx.send(f"❌ Error starting playback for **{song['title']}**: {e}")
         await play_next(ctx)
         return
 
@@ -351,15 +272,13 @@ async def play_next(ctx):
         skip_flag.discard(ctx.guild.id)
 
         if is_skip:
+            # Skipped — discard the song entirely
             cleanup_song(song)
-        elif current_loop_mode == "single":
-            # Re-insert at front, do NOT clean up the file
+        elif current_loop_mode == 'single':
             queue.appendleft(song)
-        elif current_loop_mode == "queue":
-            # Re-insert at end, do NOT clean up the file
+        elif current_loop_mode == 'queue':
             queue.append(song)
         else:
-            # 'off' — normal behavior, clean up
             cleanup_song(song)
 
         if error:
@@ -367,32 +286,18 @@ async def play_next(ctx):
 
         asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)
 
-    now_playing[ctx.guild.id] = song
+    now_playing[guild_id] = song
     ctx.voice_client.play(source, after=after_play)
 
-    # Read loop mode now just for the display message
-    loop_mode = get_loop_mode(ctx.guild.id)
-    storage_emoji = "💾" if song["storage_type"] == "disk" else "⚡"
-    loop_emoji = {"off": "", "single": " 🔂", "queue": " 🔁"}
+    loop_mode = get_loop_mode(guild_id)
+    loop_emoji = {'off': '', 'single': ' 🔂', 'queue': ' 🔁'}
     await ctx.send(
-        f"🎵 Now playing: **{song['title']}** {storage_emoji}{loop_emoji[loop_mode]}"
+        f"🎵 Now playing: **{song['title']}** 📡"
+        f"{loop_emoji[loop_mode]}"
     )
 
 
-async def fetch_with_timeout(ctx, query, timeout=120):
-    """Wraps fetch_audio with a timeout."""
-    try:
-        song = await asyncio.wait_for(
-            asyncio.get_event_loop().run_in_executor(executor, fetch_audio, query),
-            timeout=timeout,
-        )
-        return song
-    except asyncio.TimeoutError:
-        return await ctx.send(f"❌ Download timed out for: `{query}`")
-
-
 # --- Commands ---
-
 
 @bot.command(name="play", aliases=["p"])
 async def play(ctx, *, query: str):
@@ -402,23 +307,21 @@ async def play(ctx, *, query: str):
     if not ctx.voice_client:
         await ctx.author.voice.channel.connect()
 
-    await ctx.send(f"🔍 Searching and downloading: `{query}`...")
+    await ctx.send(f"🔍 Fetching: `{query}`...")
 
     guild_id = ctx.guild.id
     pending_downloads[guild_id] = pending_downloads.get(guild_id, 0) + 1
 
     try:
-        result = await fetch_with_timeout(ctx, query)
-        if isinstance(result, discord.Message):
+        song = await fetch_with_timeout(ctx, query)
+        if song is None:
             return
-        song = result
     except Exception as e:
         return await ctx.send(f"❌ Error fetching audio: {e}")
     finally:
-        # Decrement regardless of success or failure
         pending_downloads[guild_id] = max(0, pending_downloads.get(guild_id, 0) - 1)
 
-    queue = get_queue(ctx.guild.id)
+    queue = get_queue(guild_id)
 
     if ctx.voice_client.is_playing() or ctx.voice_client.is_paused():
         queue.append(song)
@@ -428,15 +331,10 @@ async def play(ctx, *, query: str):
         await play_next(ctx)
 
 
-# guilds where skip command was called
-skip_flag = set()
-
-
 @bot.command(name="skip", aliases=["s"])
 async def skip(ctx):
     if not ctx.voice_client or not ctx.voice_client.is_playing():
         return await ctx.send("❌ Nothing is playing.")
-
     skip_flag.add(ctx.guild.id)
     ctx.voice_client.stop()
     await ctx.send("⏭️ Skipped!")
@@ -467,11 +365,22 @@ async def stop(ctx):
     for song in queue:
         cleanup_song(song)
     queue.clear()
-
     if ctx.voice_client:
         ctx.voice_client.stop()
         await ctx.voice_client.disconnect()
     await ctx.send("⏹️ Stopped and disconnected.")
+
+
+@bot.command(name="leave")
+async def leave(ctx):
+    pending_downloads.pop(ctx.guild.id, None)
+    queue = get_queue(ctx.guild.id)
+    for song in queue:
+        cleanup_song(song)
+    queue.clear()
+    if ctx.voice_client:
+        await ctx.voice_client.disconnect()
+        await ctx.send("👋 Disconnected.")
 
 
 @bot.command(name="queue", aliases=["q"])
@@ -482,39 +391,81 @@ async def show_queue(ctx):
 
     lines = []
     for i, s in enumerate(queue):
-        title = s.get("title", "Unknown")
-        downloaded = "✅" if os.path.exists(s.get("filepath", "")) else "⏳"
-        lines.append(f"{i + 1}. {downloaded} {title}")
+        title = s.get('title', 'Unknown')
+        lines.append(f"{i+1}. 📡 {title}")
 
-    msg = "\n".join(lines)
-    await ctx.send(f"📋 **Queue:**\n{msg}")
+    await ctx.send(f"📋 **Queue:**\n" + "\n".join(lines))
 
 
-@bot.command(name="leave")
-async def leave(ctx):
-    pending_downloads.pop(ctx.guild.id, None)
-    queue = get_queue(ctx.guild.id)
-    for song in queue:
-        cleanup_song(song)
-    queue.clear()
+@bot.command(name="nowplaying", aliases=["np"])
+async def now_playing_cmd(ctx):
+    song = now_playing.get(ctx.guild.id)
+    if not song or not ctx.voice_client or not ctx.voice_client.is_playing():
+        return await ctx.send("❌ Nothing is playing right now.")
 
-    if ctx.voice_client:
-        await ctx.voice_client.disconnect()
-        await ctx.send("👋 Disconnected.")
+    duration = song.get('duration', 0)
+    mins, secs = divmod(int(duration), 60)
+    loop_mode = get_loop_mode(ctx.guild.id)
+    vol = int(get_volume(ctx.guild.id) * 100)
 
+    await ctx.send(
+        f"🎵 **Now Playing:** {song['title']}\n"
+        f"⏱️ Duration: {mins}:{secs:02d} | 📡 Stream\n"
+        f"🔁 Loop: {loop_mode} | 🔊 Volume: {vol}%"
+    )
+
+
+@bot.command(name="loop", aliases=["l"])
+async def loop_cmd(ctx, mode: str = None):
+    """Usage: !loop off / single / queue"""
+    modes = {'off', 'single', 'queue'}
+    if mode is None:
+        current = get_loop_mode(ctx.guild.id)
+        return await ctx.send(f"🔁 Current loop mode: **{current}**")
+    mode = mode.lower()
+    if mode not in modes:
+        return await ctx.send("❌ Options: `off`, `single`, `queue`")
+    loop_modes[ctx.guild.id] = mode
+    emojis = {'off': '➡️', 'single': '🔂', 'queue': '🔁'}
+    await ctx.send(f"{emojis[mode]} Loop mode set to: **{mode}**")
+
+
+@bot.command(name="volume", aliases=["vol", "v"])
+async def volume_cmd(ctx, vol: int = None):
+    """Set volume 1-100. No argument to see current."""
+    if vol is None:
+        current = int(get_volume(ctx.guild.id) * 100)
+        return await ctx.send(f"🔊 Current volume: **{current}%**")
+    if not 1 <= vol <= 100:
+        return await ctx.send("❌ Volume must be between 1 and 100.")
+    volumes[ctx.guild.id] = vol / 100.0
+    if ctx.voice_client and ctx.voice_client.source:
+        ctx.voice_client.source.volume = vol / 100.0
+    await ctx.send(f"🔊 Volume set to **{vol}%**")
+
+
+# --- Events ---
 
 @bot.event
-async def on_close():
-    import shutil
+async def on_voice_state_update(member, before, after):
+    """Clean up if bot is disconnected unexpectedly."""
+    if member == bot.user:
+        if before.channel and not after.channel:
+            guild_id = before.channel.guild.id
+            queue = get_queue(guild_id)
+            for song in queue:
+                cleanup_song(song)
+            queue.clear()
+            now_playing.pop(guild_id, None)
+            loop_modes.pop(guild_id, None)
+            pending_downloads.pop(guild_id, None)
+            print(f"Bot disconnected from guild {guild_id}, cleaned up.")
 
-    shutil.rmtree(TEMP_DIR_RAM, ignore_errors=True)
 
-
-# --- Error  handling ---
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.CommandNotFound):
-        return  # ignore unknown commands
+        return
     elif isinstance(error, commands.MissingRequiredArgument):
         await ctx.send(f"❌ Missing argument: `{error.param.name}`")
     elif isinstance(error, commands.BadArgument):
@@ -523,41 +474,24 @@ async def on_command_error(ctx, error):
         await ctx.send(f"❌ An error occurred: {error}")
         print(f"Unhandled error in {ctx.command}: {error}")
         import traceback
-
         traceback.print_exc()
 
 
-# --- Auto cleanup on disconnect ---
 @bot.event
-async def on_voice_state_update(member, before, after):
-    """Clean up if bot gets disconnected unexpectedly."""
-    if member == bot.user:
-        if before.channel and not after.channel:
-            # Bot was disconnected
-            guild_id = before.channel.guild.id
-            queue = get_queue(guild_id)
-            for song in queue:
-                cleanup_song(song)
-            queue.clear()
-            now_playing.pop(guild_id, None)
-            loop_modes.pop(guild_id, None)
-            print(f"Bot disconnected from guild {guild_id}, cleaned up.")
+async def on_close():
+    pass  # Nothing to clean up — no temp files used
 
-
-load_dotenv()
 
 # --- Dummy Web Server for Hugging Face ---
 app = Flask(__name__)
 
-
-@app.route("/")
+@app.route('/')
 def home():
     return "Music Bot is running!", 200
 
-
 def run_web():
     port = int(os.environ.get("PORT", 7860))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host='0.0.0.0', port=port)
 
 
 if __name__ == "__main__":
