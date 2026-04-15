@@ -13,19 +13,20 @@ import os
 import subprocess
 import shutil
 
-# --- Node.js Diagnostics ---
-print("--- Node.js Diagnostics ---")
-node_path = shutil.which('node')
-if node_path:
-    print(f"✅ Node.js found at: {node_path}")
+# --- Deno Diagnostics ---
+print("--- Deno Diagnostics ---")
+deno_path = shutil.which('deno')
+if deno_path:
+    print(f"✅ Deno found at: {deno_path}")
     try:
-        node_ver = subprocess.check_output([node_path, '--version'], text=True).strip()
-        print(f"✅ Node.js version: {node_ver}")
+        deno_ver = subprocess.check_output([deno_path, '--version'], text=True).strip().split('\n')[0]
+        print(f"✅ {deno_ver}")
     except Exception as e:
-        print(f"❌ Node.js found but failed to execute: {e}")
+        print(f"❌ Deno found but failed to execute: {e}")
 else:
-    print("❌ Node.js NOT FOUND in PATH! This will cause yt-dlp signature failures.")
-print("---------------------------")
+    print("❌ Deno NOT FOUND in PATH! yt-dlp EJS challenge solving will fail.")
+    print("   Install Deno: https://deno.com")
+print("------------------------")
 
 import gc
 import ctypes
