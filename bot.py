@@ -263,8 +263,8 @@ async def play_next(ctx):
         return
 
     try:
-        source = discord.FFmpegOpusAudio(
-            song['filepath'], bitrate=128, **FFMPEG_OPTIONS
+        source = discord.FFmpegPCMAudio(
+            song['filepath'], **FFMPEG_OPTIONS
         )
         vol = get_volume(ctx.guild.id)
         source = discord.PCMVolumeTransformer(source, volume=vol)
