@@ -4,3 +4,4 @@ yt-dlp[default]
 PyNaCl
 davey
 flask
+PyExecJS

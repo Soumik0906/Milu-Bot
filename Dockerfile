@@ -1,17 +1,19 @@
 FROM python:3.11-slim
 
-# Install FFmpeg and prerequisites for NodeSource
-RUN apt-get update && apt-get install -y ffmpeg curl gnupg && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
 
-# Install modern Node.js 20 via NodeSource (Debian's default is broken/missing for yt-dlp)
-RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
-    apt-get install -y nodejs && \
+# Install FFmpeg and Node.js from Debian's official repositories.
+# Debian Bookworm includes Node.js 18, which is the minimum required by yt-dlp.
+# This guarantees all system dependencies/shared libraries are perfectly matched.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        ffmpeg \
+        nodejs \
+        ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-# Verify Node is working
+# Verify Node is working during build
 RUN node --version
-
-WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

@@ -9,6 +9,24 @@ import concurrent.futures
 from collections import deque
 import tempfile
 import os
+
+import subprocess
+import shutil
+
+# --- Node.js Diagnostics ---
+print("--- Node.js Diagnostics ---")
+node_path = shutil.which('node')
+if node_path:
+    print(f"✅ Node.js found at: {node_path}")
+    try:
+        node_ver = subprocess.check_output([node_path, '--version'], text=True).strip()
+        print(f"✅ Node.js version: {node_ver}")
+    except Exception as e:
+        print(f"❌ Node.js found but failed to execute: {e}")
+else:
+    print("❌ Node.js NOT FOUND in PATH! This will cause yt-dlp signature failures.")
+print("---------------------------")
+
 import gc
 import ctypes
 
@@ -16,8 +34,6 @@ import ctypes
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
-
-import os
 
 # --- Cookie Diagnostics ---
 cookie_path = 'cookies.txt'
@@ -35,16 +51,12 @@ else:
     print("❌ CRITICAL ERROR: cookies.txt NOT FOUND in the directory!")
     print(f"Current directory contents: {os.listdir('.')}")
 
-
 # --- Real-Time Audio Priority ---
 gc.disable()
 
-# Lock memory in RAM so Linux doesn't page it out (prevents stutters)
-# Note: This requires running the bot with `sudo` or setting capabilities:
-# sudo setcap cap_ipc_lock=+ep /usr/bin/python3.10 (adjust to your python path)
 try:
     libc = ctypes.CDLL('libc.so.6')
-    libc.mlockall(3) # MCL_CURRENT | MCL_FUTURE
+    libc.mlockall(3)
 except Exception:
     print("⚠️ Could not lock memory. Run with `sudo` or set `cap_ipc_lock` for zero stutters.")
 
@@ -56,39 +68,47 @@ TEMP_DIR_RAM = tempfile.mkdtemp(prefix="musicbot_ram_", dir="/dev/shm")
 TEMP_DIR_DISK = "./bot_downloads"
 os.makedirs(TEMP_DIR_DISK, exist_ok=True)
 
-# --- yt-dlp Options ---
+# --- yt-dlp Options (FIXED) ---
+#
+# CHANGES MADE:
+#   1. Removed 'extractor_args' — the multiple player_client values
+#      (tv, android, ios, web) caused yt-dlp to report formats that
+#      aren't actually downloadable, leading to the
+#      "Requested format is not available" error.
+#   2. Changed format from '251/250/249/bestaudio/best' to
+#      'bestaudio/best' — this lets yt-dlp pick the best available
+#      audio format automatically instead of demanding specific
+#      itag numbers that may not exist for every video.
+#   3. Removed 'http_headers' — cookies handle authentication;
+#      a custom User-Agent can actually trigger anti-bot detection.
+#
 YDL_OPTIONS_RAM = {
-    'format': '251/250/249/bestaudio/best',
+    'format': 'bestaudio/best',
     'noplaylist': False, 'quiet': True, 'no_warnings': True,
     'default_search': 'ytsearch', 'source_address': '0.0.0.0',
     'outtmpl': f'{TEMP_DIR_RAM}/%(id)s.%(ext)s',
-    'http_headers': {'User-Agent': 'Mozilla/5.0'},
     'cookiefile': 'cookies.txt',
-    'extractor_args': {'youtube': {'player_client': ['android', 'ios', 'web']}},
 }
 
 YDL_OPTIONS_DISK = {
-    'format': '251/250/249/bestaudio/best',
+    'format': 'bestaudio/best',
     'noplaylist': False, 'quiet': True, 'no_warnings': True,
     'default_search': 'ytsearch', 'source_address': '0.0.0.0',
     'outtmpl': f'{TEMP_DIR_DISK}/%(id)s.%(ext)s',
-    'http_headers': {'User-Agent': 'Mozilla/5.0'},
     'cookiefile': 'cookies.txt',
-    'extractor_args': {'youtube': {'player_client': ['android', 'ios', 'web']}},
 }
 
-# --- FFmpeg Options (Optimized for Local Files) ---
+# --- FFmpeg Options ---
 FFMPEG_OPTIONS = {
     'before_options': (
         '-analyzeduration 20000000 '
         '-probesize 20000000 '
         '-thread_queue_size 8192 '
-        '-threads 4'                  # Use multiple CPU threads for decoding
+        '-threads 4'
     ),
     'options': (
         '-vn '
         '-bufsize 2048k '
-        # The async filter is the holy grail for discord voice stutters:
         '-af aresample=async=1:min_comp=0.01:max_soft_comp=10'
     ),
 }
@@ -102,14 +122,14 @@ def get_queue(guild_id):
     return queues[guild_id]
 
 def fetch_audio(query):
-    # 1. Quick probe to check duration (no downloading yet)
+    # 1. Quick probe (no downloading yet)
+    #    FIXED: removed extractor_args here too
     probe_opts = {
         'quiet': True,
-        'cookiefile': 'cookies.txt', 
+        'cookiefile': 'cookies.txt',
         'default_search': 'ytsearch',
-        'extractor_args': {'youtube': {'player_client': ['android', 'ios', 'web']}},
     }
-    
+
     with yt_dlp.YoutubeDL(probe_opts) as ydl:
         if not query.startswith("http"):
             query = f"ytsearch:{query}"
@@ -120,7 +140,7 @@ def fetch_audio(query):
     duration = info.get('duration') or 0
     title = info.get('title', 'Unknown Title')
 
-    # 2. Decide where to download based on length (3600s = 1 hour)
+    # 2. Decide where to download based on length
     if duration > 3600:
         ydl_opts = YDL_OPTIONS_DISK
         storage_type = 'disk'
@@ -163,7 +183,7 @@ def cleanup_song(song):
 
 # --- Play Next ---
 async def play_next(ctx):
-    gc.collect() # Manual GC between songs
+    gc.collect()
 
     queue = get_queue(ctx.guild.id)
     if not queue:
@@ -202,7 +222,7 @@ async def play_next(ctx):
         asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)
 
     ctx.voice_client.play(source, after=after_play)
-    
+
     storage_emoji = "💾" if song['storage_type'] == 'disk' else "⚡"
     await ctx.send(f"🎵 Now playing: **{song['title']}** {storage_emoji}")
 
@@ -298,7 +318,6 @@ async def on_close():
     import shutil
     shutil.rmtree(TEMP_DIR_RAM, ignore_errors=True)
 
-
 load_dotenv()
 
 # --- Dummy Web Server for Hugging Face ---
@@ -313,8 +332,5 @@ def run_web():
     app.run(host='0.0.0.0', port=port)
 
 if __name__ == "__main__":
-    # Start the dummy web server in a separate background thread
     threading.Thread(target=run_web, daemon=True).start()
-    
-    # Start the Discord Bot
     bot.run(os.getenv("DISCORD_TOKEN"))
