@@ -284,10 +284,13 @@ async def play_next(ctx):
         return
 
     def after_play(error):
-        # ✅ Read loop mode HERE, at the moment playback ends
         current_loop_mode = get_loop_mode(ctx.guild.id)
+        is_skip = ctx.guild.id in skip_flag
+        skip_flag.discard(ctx.guild.id)
 
-        if current_loop_mode == 'single':
+        if is_skip:
+            cleanup_song(song)
+        elif current_loop_mode == 'single':
             # Re-insert at front, do NOT clean up the file
             queue.appendleft(song)
         elif current_loop_mode == 'queue':
@@ -355,13 +358,18 @@ async def play(ctx, *, query: str):
         queue.append(song)
         await play_next(ctx)
 
+
+# guilds where skip command was called
+skip_flag = set()
+
 @bot.command(name="skip", aliases=["s"])
 async def skip(ctx):
-    if ctx.voice_client and ctx.voice_client.is_playing():
-        ctx.voice_client.stop()
-        await ctx.send("⏭️ Skipped!")
-    else:
-        await ctx.send("❌ Nothing is playing.")
+    if not ctx.voice_client or not ctx.voice_client.is_playing():
+        return await ctx.send("❌ Nothing is playing.")
+    
+    skip_flag.add(ctx.guild.id)
+    ctx.voice_client.stop()
+    await ctx.send("⏭️ Skipped!")
 
 @bot.command(name="pause")
 async def pause(ctx):
