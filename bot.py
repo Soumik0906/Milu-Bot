@@ -1,4 +1,5 @@
 import threading
+from discord.app_commands.commands import VALID_SLASH_COMMAND_NAME
 from flask import Flask
 import discord
 from dotenv import load_dotenv
@@ -117,6 +118,7 @@ FFMPEG_OPTIONS = {
 # --- Queue Storage ---
 queues = {}
 loop_modes = {} # guild_id -> 'off' | 'single' | 'queue'
+volumes = {} # guild_id -> float (0.0 to 1.0)
 
 def get_loop_mode(guild_id):
     return loop_modes.get(guild_id, 'off')
@@ -136,6 +138,27 @@ async def loop_cmd(ctx, mode: str = None):
     emojis = {'off': '➡️', 'single': '🔂', 'queue': '🔁'}
     await ctx.send(f"{emojis[mode]} Loop mode set to: **{mode}**")
 
+
+def get_volume(guild_id):
+    return volumes.get(guild_id, 0.5) # default volume 50%
+
+@bot.command(name="volume", aliases=["vol", "v"])
+async def volume_cmd(ctx, vol: int = None):
+    """Set volume 1-100. No argument to see current."""
+    if vol is None:
+        current = int(get_volume(ctx.guild.id) * 100)
+        return await ctx.send(f"🔊 Current volume: **{current}%**")
+
+    if not 1 <= vol <= 100:
+        return await ctx.send("❌ Volume must be between 1 and 100.")
+
+    volumes[ctx.guild.id] = vol / 100.0
+
+    # Apply to currently playing source
+    if ctx.voice_client and ctx.voice_client.source:
+        ctx.voice_client.source.volume = vol / 100.0
+
+    await ctx.send(f"🔊 Volume set to **{vol}%**")
 
 def get_queue(guild_id):
     if guild_id not in queues:
@@ -243,6 +266,8 @@ async def play_next(ctx):
         source = discord.FFmpegOpusAudio(
             song['filepath'], bitrate=128, **FFMPEG_OPTIONS
         )
+        vol = get_volume(ctx.guild.id)
+        source = discord.PCMVolumeTransformer(source, volume=vol)
     except Exception as e:
         await ctx.send(f"❌ Error playing **{song['title']}**: {e}")
         cleanup_song(song)
