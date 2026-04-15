@@ -116,6 +116,26 @@ FFMPEG_OPTIONS = {
 
 # --- Queue Storage ---
 queues = {}
+loop_modes = {} # guild_id -> 'off' | 'single' | 'queue'
+
+def get_loop_mode(guild_id):
+    return loop_modes.get(guild_id, 'off')
+
+@bot.command(name="loop", aliases=["l"])
+async def loop_cmd(ctx, mode: str = None):
+    """Usage: !loop off / single / queue"""
+    modes = {'off', 'single', 'queue'}
+    if mode is None:
+        current = get_loop_mode(ctx.guild.id)
+        await ctx.send(f"🔁 Current loop mode: **{current}**")
+        return
+    mode = mode.lower()
+    if mode not in modes:
+        return await ctx.send("❌ Options: `off`, `single`, `queue`")
+    loop_modes[ctx.guild.id] = mode
+    emojis = {'off': '➡️', 'single': '🔂', 'queue': '🔁'}
+    await ctx.send(f"{emojis[mode]} Loop mode set to: **{mode}**")
+
 
 def get_queue(guild_id):
     if guild_id not in queues:
@@ -185,9 +205,12 @@ def cleanup_song(song):
 # --- Play Next ---
 async def play_next(ctx):
     gc.collect()
-
     queue = get_queue(ctx.guild.id)
+    loop_mode = get_loop_mode(ctx.guild.id)
+
     if not queue:
+        if loop_mode != 'off':
+            pass  # loop_mode stays; queue refill handled below if needed
         if ctx.voice_client:
             await ctx.send("✅ Queue is empty. Leaving voice channel.")
             await ctx.voice_client.disconnect()
@@ -198,17 +221,27 @@ async def play_next(ctx):
 
     song = queue.popleft()
 
+    # --- LOOP LOGIC ---
+    if loop_mode == 'single':
+        # Re-add the same song to the front so it repeats
+        # We do NOT cleanup the file since we'll play it again
+        queue.appendleft(song)
+    elif loop_mode == 'queue':
+        # Re-add to the end of the queue
+        queue.append(song)
+    # else: 'off' — normal behavior, song consumed
+
     if not os.path.exists(song.get('filepath', '')):
         await ctx.send(f"❌ File missing for **{song['title']}**, skipping.")
         cleanup_song(song)
+        if loop_mode == 'single':
+            queue.popleft()  # remove the bad re-added entry
         await play_next(ctx)
         return
 
     try:
         source = discord.FFmpegOpusAudio(
-            song['filepath'],
-            bitrate=128,
-            **FFMPEG_OPTIONS
+            song['filepath'], bitrate=128, **FFMPEG_OPTIONS
         )
     except Exception as e:
         await ctx.send(f"❌ Error playing **{song['title']}**: {e}")
@@ -216,8 +249,12 @@ async def play_next(ctx):
         await play_next(ctx)
         return
 
+    # Only cleanup in 'off' mode; loop modes reuse the file
+    should_cleanup = loop_mode == 'off'
+
     def after_play(error):
-        cleanup_song(song)
+        if should_cleanup:
+            cleanup_song(song)
         if error:
             print(f"Playback error: {error}")
         asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)
@@ -225,7 +262,11 @@ async def play_next(ctx):
     ctx.voice_client.play(source, after=after_play)
 
     storage_emoji = "💾" if song['storage_type'] == 'disk' else "⚡"
-    await ctx.send(f"🎵 Now playing: **{song['title']}** {storage_emoji}")
+    loop_emoji = {"off": "", "single": " 🔂", "queue": " 🔁"}
+    await ctx.send(
+        f"🎵 Now playing: **{song['title']}** {storage_emoji}"
+        f"{loop_emoji[loop_mode]}"
+    )
 
 
 async def fetch_with_timeout(ctx, query, timeout=120):
@@ -365,7 +406,7 @@ async def on_voice_state_update(member, before, after):
                 cleanup_song(song)
             queue.clear()
             # now_playing.pop(guild_id, None)
-            # loop_modes.pop(guild_id, None)
+            loop_modes.pop(guild_id, None)
             print(f"Bot disconnected from guild {guild_id}, cleaned up.")
 
 load_dotenv()
