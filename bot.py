@@ -319,6 +319,23 @@ async def on_close():
     import shutil
     shutil.rmtree(TEMP_DIR_RAM, ignore_errors=True)
 
+
+# --- Error  handling ---
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.CommandNotFound):
+        return  # ignore unknown commands
+    elif isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send(f"❌ Missing argument: `{error.param.name}`")
+    elif isinstance(error, commands.BadArgument):
+        await ctx.send(f"❌ Bad argument: {error}")
+    else:
+        await ctx.send(f"❌ An error occurred: {error}")
+        print(f"Unhandled error in {ctx.command}: {error}")
+        import traceback
+        traceback.print_exc()
+
+
 load_dotenv()
 
 # --- Dummy Web Server for Hugging Face ---
