@@ -119,6 +119,7 @@ queues = {}
 loop_modes = {} # guild_id -> 'off' | 'single' | 'queue'
 volumes = {} # guild_id -> float (0.0 to 1.0)
 now_playing = {}
+pending_downloads = {} # guild_id -> count of active downloads
 
 def get_loop_mode(guild_id):
     return loop_modes.get(guild_id, 'off')
@@ -250,14 +251,30 @@ def cleanup_song(song):
 # --- Play Next ---
 async def play_next(ctx):
     gc.collect()
-    queue = get_queue(ctx.guild.id)
-    loop_mode = get_loop_mode(ctx.guild.id)
+    guild_id = ctx.guild.id
+    queue = get_queue(guild_id)
+    loop_mode = get_loop_mode(guild_id)
 
     if not queue:
-        if ctx.voice_client:
-            await ctx.send("✅ Queue is empty. Leaving voice channel.")
-            await ctx.voice_client.disconnect()
-        return
+        # Don't disconnect if there are still songs being downloaded
+        if pending_downloads.get(guild_id, 0) > 0:
+            await ctx.send("⏳ Waiting for downloads to finish...")
+            
+            # Wait until a song appears in the queue or downloads finish
+            while pending_downloads.get(guild_id, 0) > 0 and not queue:
+                await asyncio.sleep(1)
+            
+            # If still empty after all downloads finished, then disconnect
+            if not queue:
+                if ctx.voice_client:
+                    await ctx.send("✅ Queue is empty. Leaving voice channel.")
+                    await ctx.voice_client.disconnect()
+                return
+        else:
+            if ctx.voice_client:
+                await ctx.send("✅ Queue is empty. Leaving voice channel.")
+                await ctx.voice_client.disconnect()
+            return
 
     if not ctx.voice_client:
         return
@@ -275,7 +292,7 @@ async def play_next(ctx):
         source = discord.FFmpegPCMAudio(
             song['filepath'], **FFMPEG_OPTIONS
         )
-        vol = get_volume(ctx.guild.id)
+        vol = get_volume(guild_id)
         source = discord.PCMVolumeTransformer(source, volume=vol)
     except Exception as e:
         await ctx.send(f"❌ Error playing **{song['title']}**: {e}")
@@ -341,6 +358,10 @@ async def play(ctx, *, query: str):
         await ctx.author.voice.channel.connect()
 
     await ctx.send(f"🔍 Searching and downloading: `{query}`...")
+    
+    guild_id = ctx.guild.id
+    pending_downloads[guild_id] = pending_downloads.get(guild_id, 0) + 1
+
     try:
         result = await fetch_with_timeout(ctx, query)
         if isinstance(result, discord.Message):
@@ -348,6 +369,9 @@ async def play(ctx, *, query: str):
         song = result
     except Exception as e:
         return await ctx.send(f"❌ Error fetching audio: {e}")
+    finally:
+        # Decrement regardless of success or failure
+        pending_downloads[guild_id] = max(0, pending_downloads.get(guild_id, 0) - 1)
 
     queue = get_queue(ctx.guild.id)
 
@@ -389,6 +413,7 @@ async def resume(ctx):
 
 @bot.command(name="stop")
 async def stop(ctx):
+    pending_downloads.pop(ctx.guild.id, None)
     queue = get_queue(ctx.guild.id)
     for song in queue:
         cleanup_song(song)
@@ -416,6 +441,7 @@ async def show_queue(ctx):
 
 @bot.command(name="leave")
 async def leave(ctx):
+    pending_downloads.pop(ctx.guild.id, None)
     queue = get_queue(ctx.guild.id)
     for song in queue:
         cleanup_song(song)
