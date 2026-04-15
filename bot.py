@@ -10,7 +10,6 @@ import concurrent.futures
 from collections import deque
 import tempfile
 import os
-
 import subprocess
 import shutil
 
@@ -119,6 +118,7 @@ FFMPEG_OPTIONS = {
 queues = {}
 loop_modes = {} # guild_id -> 'off' | 'single' | 'queue'
 volumes = {} # guild_id -> float (0.0 to 1.0)
+now_playing = {}
 
 def get_loop_mode(guild_id):
     return loop_modes.get(guild_id, 'off')
@@ -159,6 +159,26 @@ async def volume_cmd(ctx, vol: int = None):
         ctx.voice_client.source.volume = vol / 100.0
 
     await ctx.send(f"🔊 Volume set to **{vol}%**")
+
+
+@bot.command(name="nowplaying", aliases=["np"])
+async def now_playing_cmd(ctx):
+    song = now_playing.get(ctx.guild.id)
+    if not song or not ctx.voice_client or not ctx.voice_client.is_playing():
+        return await ctx.send("❌ Nothing is playing right now.")
+
+    duration = song.get('duration', 0)
+    mins, secs = divmod(int(duration), 60)
+    storage = "💾 Disk" if song['storage_type'] == 'disk' else "⚡ RAM"
+    loop_mode = get_loop_mode(ctx.guild.id)
+    vol = int(get_volume(ctx.guild.id) * 100)
+
+    await ctx.send(
+        f"🎵 **Now Playing:** {song['title']}\n"
+        f"⏱️ Duration: {mins}:{secs:02d} | {storage}\n"
+        f"🔁 Loop: {loop_mode} | 🔊 Volume: {vol}%"
+    )
+
 
 def get_queue(guild_id):
     if guild_id not in queues:
@@ -218,6 +238,8 @@ def fetch_audio(query):
 
 # --- Cleanup ---
 def cleanup_song(song):
+    if not song:
+        return
     try:
         filepath = song.get('filepath')
         if filepath and os.path.exists(filepath):
@@ -284,6 +306,7 @@ async def play_next(ctx):
             print(f"Playback error: {error}")
         asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)
 
+    now_playing[ctx.guild.id] = song
     ctx.voice_client.play(source, after=after_play)
 
     storage_emoji = "💾" if song['storage_type'] == 'disk' else "⚡"
@@ -430,7 +453,7 @@ async def on_voice_state_update(member, before, after):
             for song in queue:
                 cleanup_song(song)
             queue.clear()
-            # now_playing.pop(guild_id, None)
+            now_playing.pop(guild_id, None)
             loop_modes.pop(guild_id, None)
             print(f"Bot disconnected from guild {guild_id}, cleaned up.")
 
