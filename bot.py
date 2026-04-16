@@ -101,7 +101,8 @@ class GuildState:
         self._pending        = 0
         self._skip_requested = False
         self.is_seeking = False
-        self._play_lock = asyncio.Lock()
+        self._play_lock = None
+        self.tracker = PlaybackTracker()
 
     # ── queue ops ──────────────────────────────
     def enqueue(self, song: dict) -> bool:
@@ -192,6 +193,8 @@ class GuildState:
         
     # get lock
     def get_play_lock(self):
+        if self._play_lock is None:
+            self._play_lock = asyncio.Lock()
         return self._play_lock
 
 
@@ -313,6 +316,65 @@ def _build_ffmpeg_opts(song: dict, seek_secs: int = 0) -> dict:
 
 
 # ─────────────────────────────────────────────
+#  Playback position tracking
+# ─────────────────────────────────────────────
+class PlaybackTracker:
+    """
+    Tracks elapsed playback time for the current song.
+    Thread-safe. Call start() when playback begins,
+    pause()/resume() on pause events, reset() on stop.
+    """
+
+    def __init__(self):
+        self._lock        = _threading.Lock()
+        self._start_time  = None   # monotonic time when playback started
+        self._offset      = 0.0    # seconds already elapsed before current start
+        self._paused      = False
+        self._pause_time  = None
+
+    def start(self, offset: float = 0.0) -> None:
+        with self._lock:
+            self._offset     = offset
+            self._start_time = time.monotonic()
+            self._paused     = False
+            self._pause_time = None
+
+    def pause(self) -> None:
+        with self._lock:
+            if not self._paused and self._start_time is not None:
+                self._paused     = True
+                self._pause_time = time.monotonic()
+
+    def resume(self) -> None:
+        with self._lock:
+            if self._paused and self._start_time is not None:
+                # Shift start forward by the paused duration
+                paused_for       = time.monotonic() - self._pause_time
+                self._start_time += paused_for
+                self._paused     = False
+                self._pause_time = None
+
+    def reset(self) -> None:
+        with self._lock:
+            self._start_time = None
+            self._offset     = 0.0
+            self._paused     = False
+            self._pause_time = None
+
+    @property
+    def position(self) -> float:
+        """Current playback position in seconds."""
+        with self._lock:
+            if self._start_time is None:
+                return 0.0
+            if self._paused:
+                elapsed = self._pause_time - self._start_time
+            else:
+                elapsed = time.monotonic() - self._start_time
+            return self._offset + elapsed
+
+
+# ─────────────────────────────────────────────
 #  Search result registry (per guild, per user)
 # ─────────────────────────────────────────────
 # Structure: { guild_id: { user_id: [song_dict, ...] } }
@@ -361,6 +423,133 @@ def fetch_search_results(query: str, max_results: int = 5) -> list[dict]:
             "channel":      entry.get("channel") or entry.get("uploader", "Unknown"),
         })
     return results
+
+
+# ─────────────────────────────────────────────
+#  Seek helpers
+# ─────────────────────────────────────────────
+def _progress_bar(position: float, duration: float, width: int = 20) -> str:
+    """Unicode progress bar, e.g.  ██████░░░░░░░░  2:14 / 5:00"""
+    if duration <= 0:
+        return ""
+    filled  = int(width * position / duration)
+    filled  = max(0, min(filled, width))
+    bar     = "█" * filled + "░" * (width - filled)
+    pos_str = _fmt_time(int(position))
+    dur_str = _fmt_time(int(duration))
+    return f"`{bar}` {pos_str} / {dur_str}"
+
+
+def _fmt_time(seconds: int) -> str:
+    """Format seconds → M:SS or H:MM:SS."""
+    seconds = max(0, seconds)
+    h, rem  = divmod(seconds, 3600)
+    m, s    = divmod(rem, 60)
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
+
+
+def _parse_time(raw: str) -> int | None:
+    """
+    Parse a time string into seconds.
+    Accepts:  90  |  1:30  |  1h30m  |  1h  |  30s
+    Returns None on failure.
+    """
+    raw = raw.strip().lower()
+
+    # Plain integer seconds
+    if raw.isdigit():
+        return int(raw)
+
+    # MM:SS or HH:MM:SS
+    if ":" in raw:
+        parts = raw.split(":")
+        try:
+            parts = [int(p) for p in parts]
+        except ValueError:
+            return None
+        if len(parts) == 2:
+            return parts[0] * 60 + parts[1]
+        if len(parts) == 3:
+            return parts[0] * 3600 + parts[1] * 60 + parts[2]
+        return None
+
+    # e.g. 1h30m20s  /  2h  /  45m  /  30s
+    import re
+    pattern = re.fullmatch(
+        r"(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?", raw
+    )
+    if pattern and pattern.group(0):
+        h = int(pattern.group(1) or 0)
+        m = int(pattern.group(2) or 0)
+        s = int(pattern.group(3) or 0)
+        total = h * 3600 + m * 60 + s
+        return total if total > 0 else None
+
+    return None
+
+
+async def _do_seek(ctx: commands.Context, seconds: float) -> None:
+    """
+    Core seek routine shared by !seek, !forward, and !rewind.
+    seconds is the absolute target position.
+    """
+    state = get_state(ctx.guild.id)
+    song  = state.now_playing
+
+    if not song:
+        await ctx.send("❌ Nothing is playing.")
+        return
+
+    if not ctx.voice_client or (
+        not ctx.voice_client.is_playing() and not ctx.voice_client.is_paused()
+    ):
+        await ctx.send("❌ Nothing is playing.")
+        return
+
+    duration = song.get("duration", 0)
+    seconds  = max(0.0, min(float(seconds), float(duration) - 1))
+
+    seek_song = dict(song)   # snapshot before stop()
+
+    # Signal: suppress loop re-enqueue and block play_next re-entry
+    state.is_seeking = True
+    state.request_skip()
+    ctx.voice_client.stop()
+
+    # Let the after_play callback fire and exit cleanly
+    await asyncio.sleep(0.15)
+    state.is_seeking = False
+
+    ffmpeg_opts = _build_ffmpeg_opts(seek_song, seek_secs=int(seconds))
+
+    try:
+        raw    = discord.FFmpegPCMAudio(seek_song["stream_url"], **ffmpeg_opts)
+        source = discord.PCMVolumeTransformer(raw, volume=state.volume)
+    except Exception as e:
+        await ctx.send(f"❌ FFmpeg error during seek: {e}")
+        return
+
+    def after_seek(err):
+        if err:
+            print(f"⚠️  Seek playback error: {err}")
+        if state.loop_mode == LOOP_SINGLE:
+            state.enqueue_left(seek_song)
+        elif state.loop_mode == LOOP_QUEUE:
+            state.enqueue(seek_song)
+        asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)
+
+    state.now_playing = seek_song
+    state.tracker.start(offset=seconds)            # ← accurate position tracking
+    ctx.voice_client.play(source, after=after_seek)
+
+    bar = _progress_bar(seconds, duration)
+    await ctx.send(
+        f"⏩ **{seek_song['title']}**\n"
+        f"{bar}"
+    )
+
 
 # ─────────────────────────────────────────────
 #  Bot setup
@@ -436,6 +625,7 @@ async def play_next(ctx: commands.Context, error_count: int = 0) -> None:
             asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)
 
         state.now_playing = song
+        state.tracker.start(offset=0.0)
         ctx.voice_client.play(source, after=after_play)
 
         emoji = LOOP_EMOJIS.get(state.loop_mode, "")
@@ -502,6 +692,7 @@ async def pause(ctx: commands.Context):
     """Pause playback."""
     if ctx.voice_client and ctx.voice_client.is_playing():
         ctx.voice_client.pause()
+        get_state(ctx.guild.id).tracker.pause()
         await ctx.send("⏸️ Paused.")
     else:
         await ctx.send("❌ Nothing is playing.")
@@ -512,6 +703,7 @@ async def resume(ctx: commands.Context):
     """Resume paused playback."""
     if ctx.voice_client and ctx.voice_client.is_paused():
         ctx.voice_client.resume()
+        get_state(ctx.guild.id).tracker.resume()
         await ctx.send("▶️ Resumed.")
     else:
         await ctx.send("❌ Nothing is paused.")
@@ -566,12 +758,15 @@ async def now_playing_cmd(ctx: commands.Context):
     mins, secs = divmod(int(song.get("duration", 0)), 60)
     vol = int(state.volume * 100)
 
+    position = state.tracker.position
+    bar      = _progress_bar(position, song.get("duration", 0))
+
     embed = discord.Embed(
         title="🎵 Now Playing",
-        description=f"**{song['title']}**",
+        description=f"**{song['title']}**\n{bar}",
         color=discord.Color.blurple(),
     )
-    embed.add_field(name="⏱️ Duration", value=f"{mins}:{secs:02d}")
+    # embed.add_field(name="⏱️ Duration", value=f"{mins}:{secs:02d}")
     embed.add_field(name="🔁 Loop",     value=state.loop_mode)
     embed.add_field(name="🔊 Volume",   value=f"{vol}%")
     embed.add_field(name="📋 In queue", value=str(state.length))
@@ -641,56 +836,107 @@ async def move_cmd(ctx: commands.Context, from_pos: int, to_pos: int):
     await ctx.send(f"↕️ Moved **{songs[to_pos - 1]['title']}** to position {to_pos}.")
 
 
+
+# ─────────────────────────────────────────────
+#  Seek commands 
+# ─────────────────────────────────────────────
 @bot.command(name="seek")
-async def seek_cmd(ctx: commands.Context, seconds: int):
-    """Seek to a position (seconds) in the current song."""
+async def seek_cmd(ctx: commands.Context, *, position: str):
+    """
+    Seek to a position in the current song.
+
+    Accepts:  !seek 90        (seconds)
+              !seek 1:30      (MM:SS)
+              !seek 1h30m     (hours/minutes)
+              !seek 1h30m20s
+    """
+    seconds = _parse_time(position)
+    if seconds is None:
+        return await ctx.send(
+            "❌ Invalid time format.\n"
+            "Examples: `90` · `1:30` · `1h30m` · `2h15m30s`"
+        )
+
+    song = get_state(ctx.guild.id).now_playing
+    if song:
+        duration = song.get("duration", 0)
+        if seconds > duration:
+            return await ctx.send(
+                f"❌ `{_fmt_time(seconds)}` is past the end of the song "
+                f"(duration: `{_fmt_time(int(duration))}`)."
+            )
+
+    await _do_seek(ctx, seconds)
+
+
+@bot.command(name="forward", aliases=["ff"])
+async def forward_cmd(ctx: commands.Context, *, amount: str = "30"):
+    """
+    Skip forward by an amount (default 30 s).
+
+    !forward          → +30 s
+    !forward 60       → +60 s
+    !forward 1:30     → +1 m 30 s
+    !forward 2m       → +2 minutes
+    """
+    delta = _parse_time(amount)
+    if delta is None:
+        return await ctx.send(
+            "❌ Invalid time format. Examples: `30` · `1:30` · `2m`"
+        )
+
+    state    = get_state(ctx.guild.id)
+    position = state.tracker.position + delta
+    await _do_seek(ctx, position)
+
+
+@bot.command(name="rewind", aliases=["rw"])
+async def rewind_cmd(ctx: commands.Context, *, amount: str = "30"):
+    """
+    Rewind by an amount (default 30 s).
+
+    !rewind           → −30 s
+    !rewind 60        → −60 s
+    !rewind 1:30      → −1 m 30 s
+    !rewind 2m        → −2 minutes
+    """
+    delta    = _parse_time(amount)
+    if delta is None:
+        return await ctx.send(
+            "❌ Invalid time format. Examples: `30` · `1:30` · `2m`"
+        )
+
+    state    = get_state(ctx.guild.id)
+    position = max(0.0, state.tracker.position - delta)
+    await _do_seek(ctx, position)
+
+
+@bot.command(name="position", aliases=["pos"])
+async def position_cmd(ctx: commands.Context):
+    """Show current playback position with a progress bar."""
     state = get_state(ctx.guild.id)
     song  = state.now_playing
 
-    if not song or not ctx.voice_client:
-        return await ctx.send("❌ Nothing is playing.")
+    if not song or not ctx.voice_client or (
+        not ctx.voice_client.is_playing() and not ctx.voice_client.is_paused()
+    ):
+        return await ctx.send("❌ Nothing is playing right now.")
 
-    if not ctx.voice_client.is_playing() and not ctx.voice_client.is_paused():
-        return await ctx.send("❌ Nothing is playing.")
-
+    position = state.tracker.position
     duration = song.get("duration", 0)
-    if not 0 <= seconds <= duration:
-        return await ctx.send(f"❌ Seek must be between 0 and {int(duration)}s.")
+    bar      = _progress_bar(position, duration)
+    status   = "⏸️ Paused" if ctx.voice_client.is_paused() else "▶️ Playing"
 
-    # 1. Snapshot the song BEFORE stopping (stop() triggers after_play
-    #    which may mutate now_playing / the queue)
-    seek_song = dict(song)
+    embed = discord.Embed(
+        title=f"🎵 {song['title']}",
+        description=bar,
+        color=discord.Color.blurple(),
+    )
+    embed.add_field(name="Status",   value=status)
+    embed.add_field(name="Position", value=f"`{_fmt_time(int(position))}`")
+    embed.add_field(name="Duration", value=f"`{_fmt_time(int(duration))}`")
 
-    # 2. Set flag so after_play knows to do nothing
-    state.is_seeking = True
-    state.request_skip()          # suppress loop re-enqueue inside after_play
-    ctx.voice_client.stop()       # after_play fires but consume_skip() == True
-                                  # so no re-enqueue; is_seeking blocks play_next
-
-    # Small yield so the after_play callback can complete
-    await asyncio.sleep(0.3)
-    state.is_seeking = False
-
-    ffmpeg_opts = _build_ffmpeg_opts(seek_song, seek_secs=seconds)
-    try:
-        raw    = discord.FFmpegPCMAudio(seek_song["stream_url"], **ffmpeg_opts)
-        source = discord.PCMVolumeTransformer(raw, volume=state.volume)
-    except Exception as e:
-        return await ctx.send(f"❌ FFmpeg error during seek: {e}")
-
-    def after_seek(error):
-        if error:
-            print(f"⚠️  Seek playback error: {error}")
-        # Normal after_play logic: respect loop mode
-        if state.loop_mode == LOOP_SINGLE:
-            state.enqueue_left(seek_song)
-        elif state.loop_mode == LOOP_QUEUE:
-            state.enqueue(seek_song)
-        asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)
-
-    state.now_playing = seek_song
-    ctx.voice_client.play(source, after=after_seek)
-    await ctx.send(f"⏩ Seeked to **{seconds}s** in **{seek_song['title']}**.")
+    await ctx.send(embed=embed)
 
 
 @bot.command(name="playnext", aliases=["pn"])
@@ -753,10 +999,13 @@ async def help_cmd(ctx: commands.Context):
         ("!shuffle",                    "Shuffle the queue"),
         ("!remove / !rm `<pos>`",       "Remove song at position"),
         ("!move / !mv `<from> <to>`",   "Move song in queue"),
-        ("!seek `<seconds>`",           "Seek within current song"),
         ("!clearqueue / !cq",           "Clear the queue"),
         ("!search / !se `<query>`",     "Search YouTube and pick a result"),
         ("!pick / !pk `<number>`",      "Pick a search result to play"),
+        ("!seek `<time>`",               "Seek to position (90, 1:30, 1h30m)"),
+        ("!forward / !ff `[time]`",      "Skip forward (default 30s)"),
+        ("!rewind / !rw `[time]`",       "Rewind (default 30s)"),
+        ("!position / !pos",             "Show playback position"),
     ]
     for name, value in commands_list:
         embed.add_field(name=name, value=value, inline=True)
