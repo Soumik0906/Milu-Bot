@@ -311,6 +311,57 @@ def _build_ffmpeg_opts(song: dict, seek_secs: int = 0) -> dict:
 
     return {"before_options": before, "options": FFMPEG_OPTIONS}
 
+
+# ─────────────────────────────────────────────
+#  Search result registry (per guild, per user)
+# ─────────────────────────────────────────────
+# Structure: { guild_id: { user_id: [song_dict, ...] } }
+_search_results: dict[int, dict[int, list]] = {}
+_search_lock = _threading.Lock()
+
+def _store_search(guild_id: int, user_id: int, results: list) -> None:
+    with _search_lock:
+        if guild_id not in _search_results:
+            _search_results[guild_id] = {}
+        _search_results[guild_id][user_id] = results
+
+def _get_search(guild_id: int, user_id: int) -> list | None:
+    with _search_lock:
+        return _search_results.get(guild_id, {}).get(user_id)
+
+def _clear_search(guild_id: int, user_id: int) -> None:
+    with _search_lock:
+        _search_results.get(guild_id, {}).pop(user_id, None)
+
+
+def fetch_search_results(query: str, max_results: int = 5) -> list[dict]:
+    """
+    Blocking — run in executor.
+    Returns up to max_results song dicts (with stream URLs already resolved).
+    """
+    opts = {**_YDL_OPTS, "noplaylist": True}
+    search_query = f"ytsearch{max_results}:{query}"
+
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(search_query, download=False)
+
+    entries = [e for e in info.get("entries", []) if e]
+    results = []
+    for entry in entries[:max_results]:
+        url = _best_url(entry)
+        if not url:
+            continue
+        results.append({
+            "title":        entry.get("title", "Unknown Title"),
+            "duration":     entry.get("duration") or 0,
+            "stream_url":   url,
+            "http_headers": entry.get("http_headers", {}),
+            "webpage_url":  entry.get("webpage_url", ""),
+            "fetched_at":   time.time(),
+            "channel":      entry.get("channel") or entry.get("uploader", "Unknown"),
+        })
+    return results
+
 # ─────────────────────────────────────────────
 #  Bot setup
 # ─────────────────────────────────────────────
@@ -704,11 +755,91 @@ async def help_cmd(ctx: commands.Context):
         ("!move / !mv `<from> <to>`",   "Move song in queue"),
         ("!seek `<seconds>`",           "Seek within current song"),
         ("!clearqueue / !cq",           "Clear the queue"),
+        ("!search / !se `<query>`",     "Search YouTube and pick a result"),
+        ("!pick / !pk `<number>`",      "Pick a search result to play"),
     ]
     for name, value in commands_list:
         embed.add_field(name=name, value=value, inline=True)
 
     await ctx.send(embed=embed)
+
+@bot.command(name="search", aliases=["se"])
+async def search_cmd(ctx: commands.Context, *, query: str):
+    """Search YouTube and pick a result to play."""
+    if not await _ensure_voice(ctx):
+        return
+
+    await ctx.send(f"🔍 Searching for: `{query}`…")
+
+    try:
+        results = await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(
+                executor, fetch_search_results, query
+            ),
+            timeout=FETCH_TIMEOUT_SECS,
+        )
+    except asyncio.TimeoutError:
+        return await ctx.send("❌ Search timed out.")
+    except Exception as e:
+        return await ctx.send(f"❌ Search error: {e}")
+
+    if not results:
+        return await ctx.send("❌ No results found.")
+
+    # Store results so !pick can retrieve them
+    _store_search(ctx.guild.id, ctx.author.id, results)
+
+    # Build the results embed
+    embed = discord.Embed(
+        title=f"🔎 Search results for: {query}",
+        description="Type `!pick <number>` to queue a song, or `!pick cancel` to cancel.",
+        color=discord.Color.blurple(),
+    )
+    for i, song in enumerate(results, start=1):
+        mins, secs = divmod(int(song["duration"]), 60)
+        duration_str = f"{mins}:{secs:02d}" if song["duration"] else "Unknown"
+        embed.add_field(
+            name=f"{i}. {song['title']}",
+            value=f"📺 {song['channel']}  |  ⏱️ {duration_str}",
+            inline=False,
+        )
+
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="pick", aliases=["pk"])
+async def pick_cmd(ctx: commands.Context, choice: str):
+    """Pick a search result by number, or 'cancel'."""
+    if choice.lower() == "cancel":
+        _clear_search(ctx.guild.id, ctx.author.id)
+        return await ctx.send("❌ Search cancelled.")
+
+    # Validate input is a number
+    if not choice.isdigit():
+        return await ctx.send("❌ Please enter a number or `cancel`.")
+
+    results = _get_search(ctx.guild.id, ctx.author.id)
+    if not results:
+        return await ctx.send("❌ No active search. Use `!search <query>` first.")
+
+    index = int(choice) - 1
+    if not 0 <= index < len(results):
+        return await ctx.send(f"❌ Pick a number between 1 and {len(results)}.")
+
+    song = results[index]
+    _clear_search(ctx.guild.id, ctx.author.id)
+
+    state = get_state(ctx.guild.id)
+
+    if not state.enqueue(song):
+        return await ctx.send(f"❌ Queue is full ({MAX_QUEUE_SIZE} songs max).")
+
+    if ctx.voice_client and (ctx.voice_client.is_playing() or ctx.voice_client.is_paused()):
+        await ctx.send(f"➕ Added to queue (#{state.length}): **{song['title']}**")
+    elif not state.get_play_lock().locked():
+        await play_next(ctx)
+    else:
+        await ctx.send(f"➕ Added to queue (#{state.length}): **{song['title']}**")
 
 # ─────────────────────────────────────────────
 #  Events
@@ -719,7 +850,7 @@ async def on_ready():
     await bot.change_presence(
         activity=discord.Activity(
             type=discord.ActivityType.listening,
-            name="!play | !help",
+            name="!help",
         )
     )
 
