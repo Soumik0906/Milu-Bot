@@ -101,6 +101,7 @@ class GuildState:
         self._pending        = 0
         self._skip_requested = False
         self.is_seeking = False
+        self._play_lock = asyncio.Lock()
 
     # ── queue ops ──────────────────────────────
     def enqueue(self, song: dict) -> bool:
@@ -188,6 +189,10 @@ class GuildState:
             val = self._skip_requested
             self._skip_requested = False
             return val
+        
+    # get lock
+    def get_play_lock(self):
+        return self._play_lock
 
 
 # Global registry
@@ -317,74 +322,73 @@ bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 #  Core playback engine
 # ─────────────────────────────────────────────
 async def play_next(ctx: commands.Context, error_count: int = 0) -> None:
-    """
-    Advance to the next track.
-    error_count guards against infinite recursion on repeated FFmpeg failures.
-    """
-
     state = get_state(ctx.guild.id)
 
     if state.is_seeking:
         return
 
-    if error_count >= MAX_ERRORS_IN_A_ROW:
-        await ctx.send("❌ Too many consecutive errors. Stopping.")
-        if ctx.voice_client:
-            await ctx.voice_client.disconnect()
+    # PREVENT CONCURRENT play_next CALLS
+    if state.get_play_lock().locked():
         return
 
-    # ── wait if queue is empty but fetches are still running ──
-    if state.empty:
-        if state.has_pending:
-            await ctx.send("⏳ Waiting for songs to finish fetching…")
-            for _ in range(60):
-                await asyncio.sleep(1)
-                if not state.empty:
-                    break
-
-        if state.empty:
-            await ctx.send("✅ Queue empty. Leaving voice channel.")
+    async with state.get_play_lock():
+        if error_count >= MAX_ERRORS_IN_A_ROW:
+            await ctx.send("❌ Too many consecutive errors. Stopping.")
             if ctx.voice_client:
                 await ctx.voice_client.disconnect()
             return
 
-    if not ctx.voice_client:
-        return
+        if state.empty:
+            if state.has_pending:
+                await ctx.send("⏳ Waiting for songs to finish fetching…")
+                for _ in range(60):
+                    await asyncio.sleep(1)
+                    if not state.empty:
+                        break
 
-    song = state.dequeue()
-    if song is None:
-        return
+            if state.empty:
+                await ctx.send("✅ Queue empty. Leaving voice channel.")
+                if ctx.voice_client:
+                    await ctx.voice_client.disconnect()
+                return
 
-    song = await maybe_refresh(song)
-    ffmpeg_opts = _build_ffmpeg_opts(song)
+        if not ctx.voice_client:
+            return
 
-    try:
-        raw    = discord.FFmpegPCMAudio(song["stream_url"], **ffmpeg_opts)
-        source = discord.PCMVolumeTransformer(raw, volume=state.volume)
-    except Exception as e:
-        await ctx.send(f"❌ FFmpeg error for **{song['title']}**: {e}")
-        await play_next(ctx, error_count + 1)
-        return
+        song = state.dequeue()
+        if song is None:
+            return
 
-    def after_play(error):
-        was_skipped = state.consume_skip()
+        song = await maybe_refresh(song)
+        ffmpeg_opts = _build_ffmpeg_opts(song)
 
-        if not was_skipped:
-            if state.loop_mode == LOOP_SINGLE:
-                state.enqueue_left(song)
-            elif state.loop_mode == LOOP_QUEUE:
-                state.enqueue(song)
+        try:
+            raw    = discord.FFmpegPCMAudio(song["stream_url"], **ffmpeg_opts)
+            source = discord.PCMVolumeTransformer(raw, volume=state.volume)
+        except Exception as e:
+            await ctx.send(f"❌ FFmpeg error for **{song['title']}**: {e}")
+            await play_next(ctx, error_count + 1)
+            return
 
-        if error:
-            print(f"⚠️  Playback error in '{song['title']}': {error}")
+        def after_play(error):
+            was_skipped = state.consume_skip()
 
-        asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)
+            if not was_skipped:
+                if state.loop_mode == LOOP_SINGLE:
+                    state.enqueue_left(song)
+                elif state.loop_mode == LOOP_QUEUE:
+                    state.enqueue(song)
 
-    state.now_playing = song
-    ctx.voice_client.play(source, after=after_play)
+            if error:
+                print(f"⚠️  Playback error in '{song['title']}': {error}")
 
-    emoji = LOOP_EMOJIS.get(state.loop_mode, "")
-    await ctx.send(f"🎵 Now playing: **{song['title']}** 📡 {emoji}")
+            asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)
+
+        state.now_playing = song
+        ctx.voice_client.play(source, after=after_play)
+
+        emoji = LOOP_EMOJIS.get(state.loop_mode, "")
+        await ctx.send(f"🎵 Now playing: **{song['title']}** 📡 {emoji}")
 
 
 async def _ensure_voice(ctx: commands.Context) -> bool:
@@ -424,10 +428,12 @@ async def play(ctx: commands.Context, *, query: str):
         await ctx.send(f"❌ Queue is full ({MAX_QUEUE_SIZE} songs max).")
         return
 
-    if ctx.voice_client.is_playing() or ctx.voice_client.is_paused():
+    if ctx.voice_client and (ctx.voice_client.is_playing() or ctx.voice_client.is_paused()):
         await ctx.send(f"➕ Added to queue (#{state.length}): **{song['title']}**")
-    else:
+    elif not state.get_play_lock().locked():
         await play_next(ctx)
+    else:
+        await ctx.send(f"➕ Added to queue (#{state.length}): **{song['title']}**")
 
 
 @bot.command(name="skip", aliases=["s"])
