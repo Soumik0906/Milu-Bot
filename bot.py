@@ -100,6 +100,7 @@ class GuildState:
         self.now_playing     = None
         self._pending        = 0
         self._skip_requested = False
+        self.is_seeking = False
 
     # ── queue ops ──────────────────────────────
     def enqueue(self, song: dict) -> bool:
@@ -320,13 +321,17 @@ async def play_next(ctx: commands.Context, error_count: int = 0) -> None:
     Advance to the next track.
     error_count guards against infinite recursion on repeated FFmpeg failures.
     """
+
+    state = get_state(ctx.guild.id)
+
+    if state.is_seeking:
+        return
+
     if error_count >= MAX_ERRORS_IN_A_ROW:
         await ctx.send("❌ Too many consecutive errors. Stopping.")
         if ctx.voice_client:
             await ctx.voice_client.disconnect()
         return
-
-    state = get_state(ctx.guild.id)
 
     # ── wait if queue is empty but fetches are still running ──
     if state.empty:
@@ -588,28 +593,47 @@ async def seek_cmd(ctx: commands.Context, seconds: int):
     if not song or not ctx.voice_client:
         return await ctx.send("❌ Nothing is playing.")
 
+    if not ctx.voice_client.is_playing() and not ctx.voice_client.is_paused():
+        return await ctx.send("❌ Nothing is playing.")
+
     duration = song.get("duration", 0)
     if not 0 <= seconds <= duration:
         return await ctx.send(f"❌ Seek must be between 0 and {int(duration)}s.")
 
-    ctx.voice_client.stop()   # triggers after_play → play_next; we catch it below
-    # Re-play current song from offset without going through the queue
-    ffmpeg_opts = _build_ffmpeg_opts(song, seek_secs=seconds)
+    # 1. Snapshot the song BEFORE stopping (stop() triggers after_play
+    #    which may mutate now_playing / the queue)
+    seek_song = dict(song)
+
+    # 2. Set flag so after_play knows to do nothing
+    state.is_seeking = True
+    state.request_skip()          # suppress loop re-enqueue inside after_play
+    ctx.voice_client.stop()       # after_play fires but consume_skip() == True
+                                  # so no re-enqueue; is_seeking blocks play_next
+
+    # Small yield so the after_play callback can complete
+    await asyncio.sleep(0.3)
+    state.is_seeking = False
+
+    ffmpeg_opts = _build_ffmpeg_opts(seek_song, seek_secs=seconds)
     try:
-        raw    = discord.FFmpegPCMAudio(song["stream_url"], **ffmpeg_opts)
+        raw    = discord.FFmpegPCMAudio(seek_song["stream_url"], **ffmpeg_opts)
         source = discord.PCMVolumeTransformer(raw, volume=state.volume)
-
-        def after_seek(error):
-            if error:
-                print(f"⚠️  Seek playback error: {error}")
-            asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)
-
-        # Re-enqueue to the front so after_seek → play_next picks it up,
-        # but we play it directly here instead
-        ctx.voice_client.play(source, after=after_seek)
-        await ctx.send(f"⏩ Seeked to {seconds}s in **{song['title']}**.")
     except Exception as e:
-        await ctx.send(f"❌ Seek failed: {e}")
+        return await ctx.send(f"❌ FFmpeg error during seek: {e}")
+
+    def after_seek(error):
+        if error:
+            print(f"⚠️  Seek playback error: {error}")
+        # Normal after_play logic: respect loop mode
+        if state.loop_mode == LOOP_SINGLE:
+            state.enqueue_left(seek_song)
+        elif state.loop_mode == LOOP_QUEUE:
+            state.enqueue(seek_song)
+        asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)
+
+    state.now_playing = seek_song
+    ctx.voice_client.play(source, after=after_seek)
+    await ctx.send(f"⏩ Seeked to **{seconds}s** in **{seek_song['title']}**.")
 
 
 @bot.command(name="playnext", aliases=["pn"])
