@@ -15,10 +15,15 @@ from discord.ext import commands
 from dotenv import load_dotenv
 import yt_dlp
 
+import re
+import json
+import urllib.request
+import urllib.parse
+
 # ─────────────────────────────────────────────
 #  Startup diagnostics
 # ─────────────────────────────────────────────
-print("--- Deno Diagnostics ---")
+
 _deno = shutil.which("deno")
 if _deno:
     try:
@@ -551,6 +556,90 @@ async def _do_seek(ctx: commands.Context, seconds: float) -> None:
         f"{bar}"
     )
 
+# --- Lyrics (LRCLIB) ---
+_LRCLIB_SEARCH = "https://lrclib.net/api/search"
+_LRCLIB_UA     = f"MyBot/1.0 (Discord music bot)"
+
+
+def _clean_title(title: str) -> str:
+    """
+    Strip common YouTube noise like '(Official Video)', '[HD]', etc.
+    to improve lyrics search accuracy.
+    """
+    noise = re.compile(
+        r"[\(\[](?:official\s*(?:video|audio|music\s*video|lyric\s*video)?|"
+        r"lyrics?|hd|4k|visualizer|live|explicit|audio|mv|m/v|remastered"
+        r"|\d{4}\s*remaster)[\)\]]",
+        re.IGNORECASE,
+    )
+    title = noise.sub("", title).strip()
+    # Also strip trailing whitespace and dashes left over
+    title = re.sub(r"\s*[-–—]\s*$", "", title).strip()
+    return title
+
+
+def _fetch_lyrics(title: str) -> str | None:
+    """
+    Blocking — run in executor.
+    Queries LRCLIB's free search API and returns plain lyrics or None.
+    """
+    cleaned = _clean_title(title)
+    params  = urllib.parse.urlencode({"q": cleaned})
+    url     = f"{_LRCLIB_SEARCH}?{params}"
+
+    req = urllib.request.Request(url, headers={"User-Agent": _LRCLIB_UA})
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+    except Exception as e:
+        print(f"⚠️  LRCLIB fetch error: {e}")
+        return None
+
+    if not data or not isinstance(data, list):
+        return None
+
+    # Prefer results that have plain lyrics, skip instrumentals
+    for entry in data:
+        if entry.get("instrumental"):
+            continue
+        lyrics = entry.get("plainLyrics")
+        if lyrics:
+            return lyrics
+
+    return None
+
+
+async def _fetch_lyrics_async(title: str) -> str | None:
+    loop = asyncio.get_event_loop()
+    return await asyncio.wait_for(
+        loop.run_in_executor(executor, _fetch_lyrics, title),
+        timeout=15.0,
+    )
+
+
+def _chunk_lyrics(lyrics: str, limit: int = 1900) -> list[str]:
+    """
+    Split lyrics into Discord-safe chunks (<= limit chars),
+    breaking on newlines where possible.
+    """
+    chunks = []
+    current = ""
+    for line in lyrics.splitlines(keepends=True):
+        if len(current) + len(line) > limit:
+            if current:
+                chunks.append(current)
+            # If a single line is huge, hard-split it
+            while len(line) > limit:
+                chunks.append(line[:limit])
+                line = line[limit:]
+            current = line
+        else:
+            current += line
+    if current:
+        chunks.append(current)
+    return chunks
+# -------------------------
 
 # ─────────────────────────────────────────────
 #  Bot setup
@@ -986,27 +1075,28 @@ async def help_cmd(ctx: commands.Context):
         color=discord.Color.blurple(),
     )
     commands_list = [
-        ("!play / !p `<query>`",        "Play a song or add to queue"),
-        ("!playnext / !pn `<query>`",   "Play a song next"),
-        ("!skip / !s",                  "Skip current song"),
-        ("!pause",                      "Pause playback"),
-        ("!resume",                     "Resume playback"),
-        ("!stop",                       "Stop and disconnect"),
-        ("!leave",                      "Disconnect from voice"),
-        ("!queue / !q",                 "Show the queue"),
-        ("!nowplaying / !np",           "Show current song"),
+        ("!play / !p `<query>`",         "Play a song or add to queue"),
+        ("!playnext / !pn `<query>`",    "Play a song next"),
+        ("!skip / !s",                   "Skip current song"),
+        ("!pause",                       "Pause playback"),
+        ("!resume",                      "Resume playback"),
+        ("!stop",                        "Stop and disconnect"),
+        ("!leave",                       "Disconnect from voice"),
+        ("!queue / !q",                  "Show the queue"),
+        ("!nowplaying / !np",            "Show current song"),
         ("!loop / !l `[off|single|queue]`", "Set loop mode"),
-        ("!volume / !v `[1-100]`",      "Set or view volume"),
-        ("!shuffle",                    "Shuffle the queue"),
-        ("!remove / !rm `<pos>`",       "Remove song at position"),
-        ("!move / !mv `<from> <to>`",   "Move song in queue"),
-        ("!clearqueue / !cq",           "Clear the queue"),
-        ("!search / !se `<query>`",     "Search YouTube and pick a result"),
-        ("!pick / !pk `<number>`",      "Pick a search result to play"),
+        ("!volume / !v `[1-100]`",       "Set or view volume"),
+        ("!shuffle",                     "Shuffle the queue"),
+        ("!remove / !rm `<pos>`",        "Remove song at position"),
+        ("!move / !mv `<from> <to>`",    "Move song in queue"),
+        ("!clearqueue / !cq",            "Clear the queue"),
+        ("!search / !se `<query>`",      "Search YouTube and pick a result"),
+        ("!pick / !pk `<number>`",       "Pick a search result to play"),
         ("!seek `<time>`",               "Seek to position (90, 1:30, 1h30m)"),
         ("!forward / !ff `[time]`",      "Skip forward (default 30s)"),
         ("!rewind / !rw `[time]`",       "Rewind (default 30s)"),
         ("!position / !pos",             "Show playback position"),
+        ("!lyrics / !ly `[query]`",      "Show lyrics for current song or query"),
     ]
     for name, value in commands_list:
         embed.add_field(name=name, value=value, inline=True)
@@ -1090,6 +1180,61 @@ async def pick_cmd(ctx: commands.Context, choice: str):
         await play_next(ctx)
     else:
         await ctx.send(f"➕ Added to queue (#{state.length}): **{song['title']}**")
+
+
+# ─────────────────────────────────────────────
+#  Lyrics
+# ───────────────────────────────────────────── 
+
+@bot.command(name="lyrics", aliases=["ly"])
+async def lyrics_cmd(ctx: commands.Context, *, query: str = None):
+    """
+    Show lyrics for the current song or a specific query.
+
+    !lyrics               → lyrics for whatever is playing
+    !lyrics Bohemian Rhapsody
+    !lyrics Queen - Bohemian Rhapsody
+    """
+
+    # Determine what to look up
+    if query is None:
+        state = get_state(ctx.guild.id)
+        song  = state.now_playing
+        if not song:
+            return await ctx.send(
+                "❌ Nothing is playing. Use `!lyrics <song name>` to search."
+            )
+        title = song["title"]
+    else:
+        title = query
+
+    await ctx.send(f"🔍 Fetching lyrics for: **{title}**…")
+
+    try:
+        lyrics = await _fetch_lyrics_async(title)
+    except asyncio.TimeoutError:
+        return await ctx.send("❌ Lyrics fetch timed out.")
+    except Exception as e:
+        return await ctx.send(f"❌ Lyrics error: {e}")
+
+    if not lyrics:
+        return await ctx.send(f"❌ No lyrics found for **{title}**.")
+
+    chunks = _chunk_lyrics(lyrics)
+
+    # Send first chunk as embed, rest as plain text
+    embed = discord.Embed(
+        title=f"🎤 Lyrics — {title}",
+        description=f"```{chunks[0]}```",
+        color=discord.Color.green(),
+    )
+    embed.set_footer(text=f"Page 1/{len(chunks)} · Powered by LRCLIB")
+    await ctx.send(embed=embed)
+
+    # Remaining chunks (rare for short songs)
+    for i, chunk in enumerate(chunks[1:], start=2):
+        await ctx.send(f"```{chunk}```  *(page {i}/{len(chunks)})*")
+
 
 # ─────────────────────────────────────────────
 #  Events
