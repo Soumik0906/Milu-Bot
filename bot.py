@@ -32,14 +32,15 @@ print("------------------------")
 
 load_dotenv()
 
-# Write cookies from environment secret
-_cookies_content = os.getenv("COOKIES_TXT", "")
-if _cookies_content:
-    with open("cookies.txt", "w") as _f:
-        _f.write(_cookies_content)
-    print("✅ cookies.txt written from COOKIES_TXT secret.")
-else:
-    print("⚠️  COOKIES_TXT not set — age-restricted content may fail.")
+# Write cookies from environment secret if on server
+if not os.getenv("DEBUG", ""):
+    _cookies_content = os.getenv("COOKIES_TXT", "")
+    if _cookies_content:
+        with open("cookies.txt", "w") as _f:
+            _f.write(_cookies_content)
+        print("✅ cookies.txt written from COOKIES_TXT secret.")
+    else:
+        print("⚠️  COOKIES_TXT not set — age-restricted content may fail.")
 
 # Validate cookie file
 if os.path.exists("cookies.txt"):
