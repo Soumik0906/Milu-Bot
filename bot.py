@@ -109,7 +109,7 @@ class GuildState:
         self.is_seeking = False
         self._play_lock = None
         self.tracker = PlaybackTracker()
-        self.silent          = False  
+        self.silent          = True
 
     # ── queue ops ──────────────────────────────
     def enqueue(self, song: dict) -> bool:
@@ -692,9 +692,8 @@ async def play_next(ctx: commands.Context, error_count: int = 0) -> None:
                         break
 
             if state.empty:
-                await ctx.send("✅ Queue empty. Leaving voice channel.")
-                if ctx.voice_client:
-                    await ctx.voice_client.disconnect()
+                state.now_playing = None
+                await ctx.send("✅ Queue empty.")
                 return
 
         if not ctx.voice_client:
