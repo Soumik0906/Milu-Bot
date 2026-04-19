@@ -69,6 +69,15 @@ URL_REFRESH_SECS     = 4 * 3600   # re-fetch stream URL after 4 h
 FETCH_TIMEOUT_SECS   = 120
 EXECUTOR_WORKERS     = 4
 
+LOFI_CHANNEL_ID      = os.getenv("LOFI_CHANNEL_ID") # Optional specific channel ID for lofi
+if LOFI_CHANNEL_ID:
+    try:
+        LOFI_CHANNEL_ID = int(LOFI_CHANNEL_ID)
+        print(f"✅ Lofi Home Base set to ID: {LOFI_CHANNEL_ID}")
+    except ValueError:
+        print(f"⚠️  LOFI_CHANNEL_ID '{LOFI_CHANNEL_ID}' is not a valid integer.")
+        LOFI_CHANNEL_ID = None
+
 LOOP_OFF    = "off"
 LOOP_SINGLE = "single"
 LOOP_QUEUE  = "queue"
@@ -110,6 +119,8 @@ class GuildState:
         self._play_lock = None
         self.tracker = PlaybackTracker()
         self.silent          = True
+        self.last_text_channel = None  # Tracks the last channel where a music command was used
+        self.is_auto_lofi    = False # True if current song is an auto-triggered lofi stream
 
     # ── queue ops ──────────────────────────────
     def enqueue(self, song: dict) -> bool:
@@ -208,6 +219,7 @@ class GuildState:
 # Global registry
 _states: dict[int, GuildState] = {}
 _states_lock = _threading.Lock()
+_disabled_auto_lofi: set[int] = set() # Guild IDs where auto-lofi is currently suppressed
 
 def get_state(guild_id: int) -> GuildState:
     with _states_lock:
@@ -741,8 +753,25 @@ async def _ensure_voice(ctx: commands.Context) -> bool:
     if not ctx.author.voice:
         await ctx.send("❌ You must be in a voice channel!")
         return False
+    
+    state = get_state(ctx.guild.id)
+    # Re-awaken auto-lofi if any music command is used
+    _disabled_auto_lofi.discard(ctx.guild.id)
+    state.last_text_channel = ctx.channel
+
     if not ctx.voice_client:
         await ctx.author.voice.channel.connect()
+    elif ctx.voice_client.channel != ctx.author.voice.channel:
+        if state.is_auto_lofi:
+            # Hijack the bot from lofi
+            state.clear()
+            state.is_auto_lofi = False
+            await ctx.voice_client.move_to(ctx.author.voice.channel)
+            await ctx.send(f"🚚 Moved to {ctx.author.voice.channel.mention} for your request.")
+        else:
+            await ctx.send(f"❌ I am currently busy in {ctx.voice_client.channel.mention}! Please join me there.")
+            return False
+
     return True
 
 # ─────────────────────────────────────────────
@@ -1261,11 +1290,122 @@ async def lyrics_cmd(ctx: commands.Context, *, query: str = None):
 
 
 # ─────────────────────────────────────────────
+#  Auto-Lofi Background Task
+# ─────────────────────────────────────────────
+async def lofi_monitor_loop():
+    """Background task that ensures the bot is playing lofi when idle and users are in 'lofi'."""
+    await bot.wait_until_ready()
+    print("🚀 Lofi monitor started.")
+    while not bot.is_closed():
+        try:
+            for guild in bot.guilds:
+                if guild.id in _disabled_auto_lofi:
+                    continue
+
+                # Find 'lofi' voice channel
+                lofi_channel = None
+                if LOFI_CHANNEL_ID:
+                    lofi_channel = guild.get_channel(LOFI_CHANNEL_ID)
+                    if not isinstance(lofi_channel, discord.VoiceChannel):
+                        lofi_channel = None
+                
+                if not lofi_channel:
+                    lofi_channel = discord.utils.find(
+                        lambda c: c.name.lower() == 'lofi' and isinstance(c, discord.VoiceChannel),
+                        guild.channels
+                    )
+                
+                if not lofi_channel:
+                    continue
+
+                # Check for active listeners
+                listeners = [m for m in lofi_channel.members if not m.bot]
+                if not listeners:
+                    continue
+
+                # Check bot status
+                vc = guild.voice_client
+                state = get_state(guild.id)
+
+                is_busy = False
+                if vc:
+                    # Busy if playing/paused and NOT auto-lofi, or if queue has items
+                    if not state.is_auto_lofi:
+                        if vc.is_playing() or vc.is_paused() or not state.empty or state.has_pending:
+                            is_busy = True
+                    else:
+                        # If already lofi, check if it stopped for some reason (e.g. error)
+                        if not vc.is_playing() and not vc.is_paused() and not state.has_pending:
+                            is_busy = False # needs restart
+                        else:
+                            is_busy = True # already doing its job
+                
+                # If bot is in another channel but idle, it's not busy
+                if vc and vc.channel != lofi_channel and not (vc.is_playing() or vc.is_paused() or not state.empty or state.has_pending):
+                    is_busy = False
+
+                if not is_busy:
+                    bot.loop.create_task(start_lofi(guild, lofi_channel))
+
+        except Exception as e:
+            print(f"⚠️  Lofi monitor loop error: {e}")
+        
+        await asyncio.sleep(5)
+
+
+async def start_lofi(guild: discord.Guild, lofi_channel: discord.VoiceChannel):
+    """Transition to lofi channel and start the stream."""
+    state = get_state(guild.id)
+    if state.has_pending:
+        return
+
+    state.inc_pending()
+    try:
+        vc = guild.voice_client
+        if not vc:
+            vc = await lofi_channel.connect()
+        elif vc.channel != lofi_channel:
+            await vc.move_to(lofi_channel)
+
+        state.clear()
+        state.is_auto_lofi = True
+        state.loop_mode = LOOP_SINGLE
+
+        # Reliable Lofi Girl livestream
+        query = "https://www.youtube.com/@LofiGirl/live"
+        
+        text_channel = state.last_text_channel
+        if text_channel:
+            await text_channel.send(f"📻 Auto-joining {lofi_channel.mention} and starting lofi stream...")
+
+        song = await fetch_audio_async(query)
+        state.enqueue(song)
+
+        # Mock Context for play_next
+        class MockContext:
+            def __init__(self, guild, voice_client):
+                self.guild = guild
+                self.voice_client = voice_client
+            async def send(self, *args, **kwargs):
+                if text_channel:
+                    return await text_channel.send(*args, **kwargs)
+
+        if not state.get_play_lock().locked():
+            await play_next(MockContext(guild, vc))
+
+    except Exception as e:
+        print(f"❌ Failed to start auto-lofi in {guild.name}: {e}")
+    finally:
+        state.dec_pending()
+
+
+# ─────────────────────────────────────────────
 #  Events
 # ─────────────────────────────────────────────
 @bot.event
 async def on_ready():
     print(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
+    bot.loop.create_task(lofi_monitor_loop())
     await bot.change_presence(
         activity=discord.Activity(
             type=discord.ActivityType.listening,
@@ -1280,14 +1420,26 @@ async def on_voice_state_update(
     before: discord.VoiceState,
     after:  discord.VoiceState,
 ):
-    guild = before.channel.guild if before.channel else None
+    guild = member.guild
     if guild is None:
         return
 
-    # Bot was forcibly disconnected → clean up
+    # Whitelist if someone joins lofi channel
+    is_lofi = False
+    if after.channel:
+        if LOFI_CHANNEL_ID and after.channel.id == LOFI_CHANNEL_ID:
+            is_lofi = True
+        elif after.channel.name.lower() == 'lofi':
+            is_lofi = True
+
+    if is_lofi and not member.bot:
+        _disabled_auto_lofi.discard(guild.id)
+
+    # Bot was forcibly disconnected → clean up and suppress
     if member == bot.user and before.channel and not after.channel:
         remove_state(guild.id)
-        print(f"🔌 Bot disconnected from {guild.name}; state cleaned up.")
+        _disabled_auto_lofi.add(guild.id)
+        print(f"🔌 Bot disconnected from {guild.name}; state cleaned up and auto-lofi suppressed.")
         return
 
     # Auto-leave if everyone else leaves
@@ -1297,6 +1449,7 @@ async def on_voice_state_update(
         if not non_bots:
             await vc.disconnect()
             remove_state(guild.id)
+            _disabled_auto_lofi.add(guild.id)
             print(f"🚪 Auto-left {guild.name} — channel empty.")
 
 
