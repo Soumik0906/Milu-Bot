@@ -109,6 +109,7 @@ class GuildState:
         self.is_seeking = False
         self._play_lock = None
         self.tracker = PlaybackTracker()
+        self.silent          = False  
 
     # ── queue ops ──────────────────────────────
     def enqueue(self, song: dict) -> bool:
@@ -217,6 +218,20 @@ def get_state(guild_id: int) -> GuildState:
 def remove_state(guild_id: int):
     with _states_lock:
         _states.pop(guild_id, None)
+
+# ─────────────────────────────────────────────
+#  Monkeypatch Context.send for global silent mode support
+# ─────────────────────────────────────────────
+_original_send = commands.Context.send
+
+async def _silent_send(self, *args, **kwargs):
+    if self.guild:
+        state = get_state(self.guild.id)
+        if state.silent:
+            kwargs["silent"] = True
+    return await _original_send(self, *args, **kwargs)
+
+commands.Context.send = _silent_send
 
 # ─────────────────────────────────────────────
 #  Thread pool
@@ -895,6 +910,15 @@ async def volume_cmd(ctx: commands.Context, vol: int = None):
     await ctx.send(f"🔊 Volume set to **{vol}%**")
 
 
+@bot.command(name="silent")
+async def silent_cmd(ctx: commands.Context):
+    """Toggle silent mode (no notifications)."""
+    state = get_state(ctx.guild.id)
+    state.silent = not state.silent
+    status = "ON" if state.silent else "OFF"
+    await ctx.send(f"🔇 Silent mode is now **{status}**.")
+
+
 @bot.command(name="shuffle")
 async def shuffle_cmd(ctx: commands.Context):
     """Shuffle the queue."""
@@ -1086,6 +1110,7 @@ async def help_cmd(ctx: commands.Context):
         ("!nowplaying / !np",            "Show current song"),
         ("!loop / !l `[off|single|queue]`", "Set loop mode"),
         ("!volume / !v `[1-100]`",       "Set or view volume"),
+        ("!silent",                      "Toggle silent mode (no notifications)"),
         ("!shuffle",                     "Shuffle the queue"),
         ("!remove / !rm `<pos>`",        "Remove song at position"),
         ("!move / !mv `<from> <to>`",    "Move song in queue"),
