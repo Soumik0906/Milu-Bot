@@ -62,7 +62,7 @@ else:
 # ─────────────────────────────────────────────
 #  Constants
 # ─────────────────────────────────────────────
-DEFAULT_VOLUME       = 0.5
+DEFAULT_VOLUME       = 1.0
 MAX_QUEUE_SIZE       = 200
 MAX_ERRORS_IN_A_ROW  = 5
 URL_REFRESH_SECS     = 4 * 3600   # re-fetch stream URL after 4 h
@@ -121,6 +121,9 @@ class GuildState:
         self.silent          = True
         self.last_text_channel = None  # Tracks the last channel where a music command was used
         self.is_auto_lofi    = False # True if current song is an auto-triggered lofi stream
+        self.autoplay        = False # Autoplay recommendations when queue is empty
+        self._history        = deque(maxlen=20)  # Recently played songs (for recommendations)
+        self._played_ids     = deque(maxlen=50)  # Video IDs already played (avoid repeats)
 
     # ── queue ops ──────────────────────────────
     def enqueue(self, song: dict) -> bool:
@@ -215,6 +218,23 @@ class GuildState:
             self._play_lock = asyncio.Lock()
         return self._play_lock
 
+    # ── play history (for recommendations) ────
+    def add_to_history(self, song: dict) -> None:
+        """Record a song in play history."""
+        with self._lock:
+            self._history.append(song)
+            vid_id = _extract_video_id(song.get("webpage_url", ""))
+            if vid_id:
+                self._played_ids.append(vid_id)
+
+    def get_history(self) -> list:
+        with self._lock:
+            return list(self._history)
+
+    def was_played(self, video_id: str) -> bool:
+        with self._lock:
+            return video_id in self._played_ids
+
 
 # Global registry
 _states: dict[int, GuildState] = {}
@@ -262,6 +282,13 @@ _YDL_OPTS = {
     "noplaylist":     False,
     "format_sort":    ["acodec:opus", "acodec:aac"],
 }
+
+_VIDEO_ID_RE = re.compile(r"(?:v=|youtu\.be/)([\w-]{11})")
+
+def _extract_video_id(url: str) -> str | None:
+    """Extract YouTube video ID from a URL."""
+    m = _VIDEO_ID_RE.search(url)
+    return m.group(1) if m else None
 
 def _best_url(info: dict) -> str | None:
     """Pull the best audio stream URL from a yt-dlp info dict."""
@@ -669,6 +696,101 @@ def _chunk_lyrics(lyrics: str, limit: int = 1900) -> list[str]:
 # -------------------------
 
 # ─────────────────────────────────────────────
+#  Recommendation engine
+# ─────────────────────────────────────────────
+
+def fetch_recommendations(video_id: str, max_results: int = 10) -> list[dict]:
+    """
+    Blocking — run in executor.
+    Uses YouTube's auto-generated Radio Mix (RD playlist) to find related songs.
+    Returns a list of song dicts with stream URLs resolved.
+    """
+    mix_url = f"https://www.youtube.com/watch?v={video_id}&list=RD{video_id}"
+    opts = {
+        **_YDL_OPTS,
+        "noplaylist": False,
+        "playlist_items": f"2-{max_results + 1}",  # Skip the seed video itself
+        "extract_flat": False,
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(mix_url, download=False)
+    except Exception as e:
+        print(f"⚠️  Radio Mix fetch failed for {video_id}: {e}")
+        return []
+
+    entries = [e for e in info.get("entries", []) if e]
+    results = []
+    for entry in entries:
+        url = _best_url(entry)
+        if not url:
+            continue
+        results.append({
+            "title":        entry.get("title", "Unknown Title"),
+            "duration":     entry.get("duration") or 0,
+            "stream_url":   url,
+            "http_headers": entry.get("http_headers", {}),
+            "webpage_url":  entry.get("webpage_url", ""),
+            "fetched_at":   time.time(),
+            "channel":      entry.get("channel") or entry.get("uploader", "Unknown"),
+            "is_recommended": True,
+        })
+    return results
+
+
+async def fetch_recommendations_async(video_id: str, max_results: int = 10) -> list[dict]:
+    loop = asyncio.get_event_loop()
+    return await asyncio.wait_for(
+        loop.run_in_executor(executor, fetch_recommendations, video_id, max_results),
+        timeout=FETCH_TIMEOUT_SECS,
+    )
+
+
+async def _autoplay_next(ctx, state: GuildState) -> bool:
+    """
+    Try to fetch and enqueue a recommended song based on play history.
+    Returns True if a song was enqueued, False otherwise.
+    """
+    history = state.get_history()
+    if not history:
+        return False
+
+    # Pick a seed song — prefer the most recently played
+    # Try up to 3 seeds from history in case one fails
+    seeds = []
+    for song in reversed(history):
+        vid_id = _extract_video_id(song.get("webpage_url", ""))
+        if vid_id and vid_id not in seeds:
+            seeds.append(vid_id)
+        if len(seeds) >= 3:
+            break
+
+    if not seeds:
+        return False
+
+    for seed_id in seeds:
+        try:
+            recommendations = await fetch_recommendations_async(seed_id, max_results=10)
+        except (asyncio.TimeoutError, Exception) as e:
+            print(f"⚠️  Recommendation fetch failed for seed {seed_id}: {e}")
+            continue
+
+        # Filter out already-played songs
+        fresh = [
+            r for r in recommendations
+            if not state.was_played(_extract_video_id(r.get("webpage_url", "")) or "")
+        ]
+
+        if fresh:
+            # Pick a random one from the top results for variety
+            pick = random.choice(fresh[:5])
+            state.enqueue(pick)
+            return True
+
+    return False
+
+# ─────────────────────────────────────────────
 #  Bot setup
 # ─────────────────────────────────────────────
 intents = discord.Intents.default()
@@ -702,6 +824,19 @@ async def play_next(ctx: commands.Context, error_count: int = 0) -> None:
                     await asyncio.sleep(1)
                     if not state.empty:
                         break
+
+            # Try autoplay before giving up
+            if state.empty and state.autoplay and not state.is_auto_lofi:
+                await ctx.send("🔮 Queue empty — finding a recommendation…")
+                try:
+                    got_one = await _autoplay_next(ctx, state)
+                except Exception as e:
+                    print(f"⚠️  Autoplay error: {e}")
+                    got_one = False
+                if not got_one:
+                    state.now_playing = None
+                    await ctx.send("❌ Couldn't find a recommendation. Queue empty.")
+                    return
 
             if state.empty:
                 state.now_playing = None
@@ -741,11 +876,13 @@ async def play_next(ctx: commands.Context, error_count: int = 0) -> None:
             asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)
 
         state.now_playing = song
+        state.add_to_history(song)
         state.tracker.start(offset=0.0)
         ctx.voice_client.play(source, after=after_play)
 
         emoji = LOOP_EMOJIS.get(state.loop_mode, "")
-        await ctx.send(f"🎵 Now playing: **{song['title']}** 📡 {emoji}")
+        rec_tag = " 🔮" if song.get("is_recommended") else ""
+        await ctx.send(f"🎵 Now playing: **{song['title']}** 📡 {emoji}{rec_tag}")
 
 
 async def _ensure_voice(ctx: commands.Context) -> bool:
@@ -1150,6 +1287,8 @@ async def help_cmd(ctx: commands.Context):
         ("!rewind / !rw `[time]`",       "Rewind (default 30s)"),
         ("!position / !pos",             "Show playback position"),
         ("!lyrics / !ly `[query]`",      "Show lyrics for current song or query"),
+        ("!autoplay / !ap",              "Toggle autoplay recommendations"),
+        ("!recommend / !rec`[count]`",   "Show recommendations based on history"),
     ]
     for name, value in commands_list:
         embed.add_field(name=name, value=value, inline=True)
@@ -1233,6 +1372,88 @@ async def pick_cmd(ctx: commands.Context, choice: str):
         await play_next(ctx)
     else:
         await ctx.send(f"➕ Added to queue (#{state.length}): **{song['title']}**")
+
+
+# ─────────────────────────────────────────────
+#  Autoplay / Recommendation commands
+# ─────────────────────────────────────────────
+
+@bot.command(name="autoplay", aliases=["ap"])
+async def autoplay_cmd(ctx: commands.Context):
+    """Toggle autoplay — automatically play recommended songs when the queue is empty."""
+    state = get_state(ctx.guild.id)
+    state.autoplay = not state.autoplay
+    status = "ON 🔮" if state.autoplay else "OFF"
+    await ctx.send(f"🔮 Autoplay is now **{status}**.")
+
+
+@bot.command(name="recommend", aliases=["rec"])
+async def recommend_cmd(ctx: commands.Context, count: int = 5):
+    """
+    Show recommended songs based on your play history.
+    Use !recommend 3 to show 3 recommendations.
+    """
+    if not await _ensure_voice(ctx):
+        return
+
+    state = get_state(ctx.guild.id)
+    history = state.get_history()
+
+    if not history:
+        return await ctx.send("❌ No play history yet — play some songs first!")
+
+    # Find a seed video ID
+    seed_id = None
+    for song in reversed(history):
+        seed_id = _extract_video_id(song.get("webpage_url", ""))
+        if seed_id:
+            break
+
+    if not seed_id:
+        return await ctx.send("❌ Couldn't determine a seed song for recommendations.")
+
+    count = max(1, min(count, 10))
+    await ctx.send(f"🔮 Finding recommendations based on **{history[-1]['title']}**…")
+
+    try:
+        recommendations = await fetch_recommendations_async(seed_id, max_results=count + 5)
+    except asyncio.TimeoutError:
+        return await ctx.send("❌ Recommendation fetch timed out.")
+    except Exception as e:
+        return await ctx.send(f"❌ Recommendation error: {e}")
+
+    if not recommendations:
+        return await ctx.send("❌ No recommendations found.")
+
+    # Filter out already-played
+    fresh = [
+        r for r in recommendations
+        if not state.was_played(_extract_video_id(r.get("webpage_url", "")) or "")
+    ]
+
+    show = fresh[:count] if fresh else recommendations[:count]
+
+    # Store as search results so !pick works
+    _store_search(ctx.guild.id, ctx.author.id, show)
+
+    embed = discord.Embed(
+        title="🔮 Recommended Songs",
+        description=(
+            f"Based on: **{history[-1]['title']}**\n"
+            f"Type `!pick <number>` to queue a song, or `!pick cancel` to dismiss."
+        ),
+        color=discord.Color.purple(),
+    )
+    for i, song in enumerate(show, start=1):
+        mins, secs = divmod(int(song["duration"]), 60)
+        duration_str = f"{mins}:{secs:02d}" if song["duration"] else "Unknown"
+        embed.add_field(
+            name=f"{i}. {song['title']}",
+            value=f"📺 {song.get('channel', 'Unknown')}  |  ⏱️ {duration_str}",
+            inline=False,
+        )
+
+    await ctx.send(embed=embed)
 
 
 # ─────────────────────────────────────────────
